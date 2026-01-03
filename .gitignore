@@ -1,1 +1,32 @@
-﻿# Secrets\n.env\n.env.*\n\n# Local venv/cache\n.venv/\n__pycache__/\n
+﻿# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.env
+node_modules
+dist
+dist-ssr
+*.local
+
+# Secrets / environment
+.env
+.env.*
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Local runtime data (do not commit)
+data/*.json
+recordings/
