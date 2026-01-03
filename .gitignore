@@ -1,0 +1,1 @@
+﻿# Secrets\n.env\n.env.*\n\n# Local venv/cache\n.venv/\n__pycache__/\n
