@@ -22,7 +22,7 @@ from livekit.agents import (
     room_io,
 )
 from livekit.agents.llm import function_tool
-from livekit.plugins import silero
+from livekit.plugins import openai, silero
 
 load_dotenv()
 logger = logging.getLogger("basic-agent")
@@ -255,9 +255,13 @@ async def _entrypoint_impl(ctx: JobContext):
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
     session = AgentSession(
-        stt="deepgram/nova-3",
-        llm="openai/gpt-4.1-mini",
-        tts="cartesia/sonic-2:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        # Use provider plugins directly (avoids LiveKit hosted inference quota).
+        stt=openai.STT(model=os.environ.get("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")),
+        llm=openai.LLM(model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4.1-mini")),
+        tts=openai.TTS(
+            model=os.environ.get("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
+            voice=os.environ.get("OPENAI_TTS_VOICE", "ash"),
+        ),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
         resume_false_interruption=True,
