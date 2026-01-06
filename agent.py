@@ -477,13 +477,14 @@ async def _entrypoint_impl(ctx: JobContext):
     )
 
 
-@server.rtc_session()
+@server.rtc_session(agent_name=LIVEKIT_AGENT_NAME)
 async def entrypoint(ctx: JobContext):
     await _entrypoint_impl(ctx)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logger.info(f"Starting agent worker (agent_name='{LIVEKIT_AGENT_NAME or ''}')")
     cli.run_app(server)
 
 
