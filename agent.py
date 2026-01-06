@@ -31,6 +31,19 @@ logger = logging.getLogger("basic-agent")
 # IMPORTANT: When agent_name is set, LiveKit uses explicit dispatch (not automatic room assignment).
 LIVEKIT_AGENT_NAME = os.environ.get("LIVEKIT_AGENT_NAME", "").strip()
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
 
 def _extract_prompt_from_room(ctx: JobContext) -> str | None:
     """
@@ -243,6 +256,18 @@ server = AgentServer()
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
+    # Reuse model clients across sessions to reduce "press Talk → agent ready" latency.
+    proc.userdata["stt"] = openai.STT(
+        model=os.environ.get("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe"),
+        use_realtime=_env_bool("OPENAI_STT_REALTIME", True),
+    )
+    proc.userdata["llm"] = openai.LLM(model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4.1-mini"))
+    proc.userdata["tts"] = openai.TTS(
+        model=os.environ.get("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
+        voice=os.environ.get("OPENAI_TTS_VOICE", "ash"),
+        # Smaller/faster audio payload than mp3; helps perceived latency.
+        response_format=os.environ.get("OPENAI_TTS_FORMAT", "opus"),
+    )
 
 
 server.setup_fnc = prewarm
@@ -256,16 +281,17 @@ async def _entrypoint_impl(ctx: JobContext):
 
     session = AgentSession(
         # Use provider plugins directly (avoids LiveKit hosted inference quota).
-        stt=openai.STT(model=os.environ.get("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")),
-        llm=openai.LLM(model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4.1-mini")),
-        tts=openai.TTS(
-            model=os.environ.get("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
-            voice=os.environ.get("OPENAI_TTS_VOICE", "ash"),
-        ),
+        stt=ctx.proc.userdata.get("stt"),
+        llm=ctx.proc.userdata.get("llm"),
+        tts=ctx.proc.userdata.get("tts"),
         vad=ctx.proc.userdata["vad"],
+        # Reduce "wait after you stop talking" time before the agent answers.
+        turn_detection="vad",
+        min_endpointing_delay=_env_float("LK_MIN_ENDPOINTING_DELAY", 0.25),
+        max_endpointing_delay=_env_float("LK_MAX_ENDPOINTING_DELAY", 1.2),
         preemptive_generation=True,
         resume_false_interruption=True,
-        false_interruption_timeout=1.0,
+        false_interruption_timeout=_env_float("LK_FALSE_INTERRUPTION_TIMEOUT", 1.0),
     )
 
     @session.on("user_state_changed")
