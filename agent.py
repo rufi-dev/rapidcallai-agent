@@ -291,10 +291,15 @@ async def _entrypoint_impl(ctx: JobContext):
         llm=ctx.proc.userdata.get("llm"),
         tts=ctx.proc.userdata.get("tts"),
         vad=ctx.proc.userdata["vad"],
+        # Reduce audio "cutting" caused by aggressive interruption detection in noisy rooms.
+        # Console mode feels smoother because it doesn't have RTC echo/noise artifacts.
+        allow_interruptions=os.environ.get("LK_ALLOW_INTERRUPTIONS", "true").lower() == "true",
+        min_interruption_duration=_env_float("LK_MIN_INTERRUPTION_DURATION", 0.9),
+        min_interruption_words=int(float(os.environ.get("LK_MIN_INTERRUPTION_WORDS", "2"))),
         # Reduce "wait after you stop talking" time before the agent answers.
         turn_detection="vad",
-        min_endpointing_delay=_env_float("LK_MIN_ENDPOINTING_DELAY", 0.25),
-        max_endpointing_delay=_env_float("LK_MAX_ENDPOINTING_DELAY", 1.2),
+        min_endpointing_delay=_env_float("LK_MIN_ENDPOINTING_DELAY", 0.15),
+        max_endpointing_delay=_env_float("LK_MAX_ENDPOINTING_DELAY", 0.8),
         preemptive_generation=True,
         resume_false_interruption=True,
         false_interruption_timeout=_env_float("LK_FALSE_INTERRUPTION_TIMEOUT", 1.0),
@@ -440,7 +445,12 @@ async def _entrypoint_impl(ctx: JobContext):
         agent=MyAgent(extra_prompt=extra_prompt, welcome=welcome),
         room=ctx.room,
         room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(),
+            # Smaller frames reduce end-to-end latency for both STT and agent response timing.
+            audio_input=room_io.AudioInputOptions(
+                frame_size_ms=int(float(os.environ.get("LK_AUDIO_FRAME_MS", "20"))),
+                pre_connect_audio=True,
+                pre_connect_audio_timeout=_env_float("LK_PRECONNECT_AUDIO_TIMEOUT", 2.0),
+            ),
             text_output=True,  # publish transcriptions to the room for clients to render
         ),
     )
