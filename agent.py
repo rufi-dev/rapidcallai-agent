@@ -18,11 +18,12 @@ from livekit.agents import (
     MetricsCollectedEvent,
     RunContext,
     cli,
+    inference,
     metrics,
     room_io,
 )
 from livekit.agents.llm import function_tool
-from livekit.plugins import cartesia, deepgram, openai, silero
+from livekit.plugins import openai, silero
 
 load_dotenv()
 logger = logging.getLogger("basic-agent")
@@ -257,22 +258,18 @@ server = AgentServer()
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
     # Reuse model clients across sessions to reduce "press Talk → agent ready" latency.
-    proc.userdata["stt"] = deepgram.STT(
-        model=os.environ.get("DEEPGRAM_STT_MODEL", "nova-3"),
-        language=os.environ.get("DEEPGRAM_LANGUAGE", "en-US"),
-        interim_results=True,
-        # Deepgram can endpoint very quickly; this helps responsiveness a lot.
-        endpointing_ms=int(float(os.environ.get("DEEPGRAM_ENDPOINTING_MS", "25"))),
-        no_delay=True,
-        punctuate=True,
-        filler_words=True,
+    # Use LiveKit Cloud Inference (agent-gateway) for STT/TTS (no third-party plugin SDKs).
+    # NOTE: Requires LIVEKIT_API_KEY and LIVEKIT_API_SECRET (and optionally LIVEKIT_INFERENCE_URL).
+    proc.userdata["stt"] = inference.STT(
+        model=os.environ.get("LK_STT_MODEL", "auto"),
+        # For best realtime UX, ensure interim results are enabled.
+        extra_kwargs={"interim_results": True},
     )
     proc.userdata["llm"] = openai.LLM(model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4.1-mini"))
-    proc.userdata["tts"] = cartesia.TTS(
-        model=os.environ.get("CARTESIA_TTS_MODEL", "sonic-2"),
-        voice=os.environ.get("CARTESIA_VOICE", "a0e99841-438c-4a64-b679-ae501e7d6091"),
-        # Enable streaming pacing (reduces "first audio" latency).
-        text_pacing=True,
+    proc.userdata["tts"] = inference.TTS(
+        # Choose a fast default; you can override via LK_TTS_MODEL and LK_TTS_VOICE.
+        model=os.environ.get("LK_TTS_MODEL", "cartesia/sonic-2"),
+        voice=os.environ.get("LK_TTS_VOICE", ""),
     )
 
 
@@ -451,7 +448,9 @@ async def _entrypoint_impl(ctx: JobContext):
                 pre_connect_audio=True,
                 pre_connect_audio_timeout=_env_float("LK_PRECONNECT_AUDIO_TIMEOUT", 2.0),
             ),
-            text_output=True,  # publish transcriptions to the room for clients to render
+            # Publish transcriptions to the room for clients to render.
+            # Disable sync-to-audio alignment so interim transcripts arrive as soon as STT produces them.
+            text_output=room_io.TextOutputOptions(sync_transcription=False),
         ),
     )
 
