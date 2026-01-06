@@ -471,8 +471,9 @@ async def _entrypoint_impl(ctx: JobContext):
                 pre_connect_audio_timeout=_env_float("LK_PRECONNECT_AUDIO_TIMEOUT", 2.0),
             ),
             # Publish transcriptions to the room for clients to render.
-            # Disable sync-to-audio alignment so interim transcripts arrive as soon as STT produces them.
-            text_output=room_io.TextOutputOptions(sync_transcription=False),
+            # Keep agent output text synced to TTS audio so the UI doesn't "dump" the full response at once.
+            # (User STT interim results are controlled by the STT backend settings, not this flag.)
+            text_output=room_io.TextOutputOptions(sync_transcription=True),
         ),
     )
 
