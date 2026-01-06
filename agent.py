@@ -22,7 +22,7 @@ from livekit.agents import (
     room_io,
 )
 from livekit.agents.llm import function_tool
-from livekit.plugins import openai, silero
+from livekit.plugins import cartesia, deepgram, openai, silero
 
 load_dotenv()
 logger = logging.getLogger("basic-agent")
@@ -257,16 +257,22 @@ server = AgentServer()
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
     # Reuse model clients across sessions to reduce "press Talk → agent ready" latency.
-    proc.userdata["stt"] = openai.STT(
-        model=os.environ.get("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe"),
-        use_realtime=_env_bool("OPENAI_STT_REALTIME", True),
+    proc.userdata["stt"] = deepgram.STT(
+        model=os.environ.get("DEEPGRAM_STT_MODEL", "nova-3"),
+        language=os.environ.get("DEEPGRAM_LANGUAGE", "en-US"),
+        interim_results=True,
+        # Deepgram can endpoint very quickly; this helps responsiveness a lot.
+        endpointing_ms=int(float(os.environ.get("DEEPGRAM_ENDPOINTING_MS", "25"))),
+        no_delay=True,
+        punctuate=True,
+        filler_words=True,
     )
     proc.userdata["llm"] = openai.LLM(model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4.1-mini"))
-    proc.userdata["tts"] = openai.TTS(
-        model=os.environ.get("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
-        voice=os.environ.get("OPENAI_TTS_VOICE", "ash"),
-        # Smaller/faster audio payload than mp3; helps perceived latency.
-        response_format=os.environ.get("OPENAI_TTS_FORMAT", "opus"),
+    proc.userdata["tts"] = cartesia.TTS(
+        model=os.environ.get("CARTESIA_TTS_MODEL", "sonic-2"),
+        voice=os.environ.get("CARTESIA_VOICE", "a0e99841-438c-4a64-b679-ae501e7d6091"),
+        # Enable streaming pacing (reduces "first audio" latency).
+        text_pacing=True,
     )
 
 
