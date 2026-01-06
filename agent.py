@@ -248,8 +248,7 @@ def prewarm(proc: JobProcess):
 server.setup_fnc = prewarm
 
 
-@server.rtc_session(agent_name=LIVEKIT_AGENT_NAME)
-async def entrypoint(ctx: JobContext):
+async def _entrypoint_impl(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
     # Ensure we are connected and have up-to-date room metadata / participant linkage.
@@ -409,6 +408,21 @@ async def entrypoint(ctx: JobContext):
             text_output=True,  # publish transcriptions to the room for clients to render
         ),
     )
+
+
+# Register both:
+# - a named entrypoint (used by Telephony dispatch rules / playground targeting)
+# - a default entrypoint (used by RapidCallAI web test rooms which don't target an agent name)
+if LIVEKIT_AGENT_NAME:
+
+    @server.rtc_session(agent_name=LIVEKIT_AGENT_NAME)
+    async def entrypoint_named(ctx: JobContext):
+        await _entrypoint_impl(ctx)
+
+
+@server.rtc_session()
+async def entrypoint(ctx: JobContext):
+    await _entrypoint_impl(ctx)
 
 
 if __name__ == "__main__":
