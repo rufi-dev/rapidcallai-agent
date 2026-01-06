@@ -27,6 +27,10 @@ from livekit.plugins import silero
 load_dotenv()
 logger = logging.getLogger("basic-agent")
 
+# Optional explicit agent name. If set, this agent can be targeted by LiveKit Telephony dispatch rules / playground.
+# IMPORTANT: When agent_name is set, LiveKit uses explicit dispatch (not automatic room assignment).
+LIVEKIT_AGENT_NAME = os.environ.get("LIVEKIT_AGENT_NAME", "").strip()
+
 
 def _extract_prompt_from_room(ctx: JobContext) -> str | None:
     """
@@ -226,7 +230,7 @@ def prewarm(proc: JobProcess):
 server.setup_fnc = prewarm
 
 
-@server.rtc_session()
+@server.rtc_session(agent_name=LIVEKIT_AGENT_NAME)
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
