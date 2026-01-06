@@ -146,6 +146,24 @@ def _extract_sip_numbers(ctx: JobContext) -> tuple[str | None, str | None]:
     return trunk_number, caller_number
 
 
+async def _wait_for_sip_numbers(ctx: JobContext, *, timeout_s: float = 6.0) -> tuple[str | None, str | None]:
+    """
+    In telephony rooms, the SIP participant may join slightly after we connect.
+    Retry briefly so we can reliably read sip.trunkPhoneNumber/sip.phoneNumber and fetch the real prompt.
+    """
+    deadline = asyncio.get_event_loop().time() + max(0.0, timeout_s)
+    last = (None, None)
+    attempt = 0
+    while asyncio.get_event_loop().time() < deadline:
+        attempt += 1
+        last = _extract_sip_numbers(ctx)
+        if last[0] or last[1]:
+            return last
+        await asyncio.sleep(0.4)
+    logger.info(f"SIP attributes not found after {attempt} attempts; falling back to room metadata prompt")
+    return last
+
+
 class MyAgent(Agent):
     def __init__(self, *, extra_prompt: str | None = None, welcome: dict | None = None) -> None:
         style = (
@@ -322,7 +340,7 @@ async def entrypoint(ctx: JobContext):
     prompt_from_internal: str | None = None
     welcome_from_internal: dict | None = None
 
-    trunk_to, caller_from = _extract_sip_numbers(ctx)
+    trunk_to, caller_from = await _wait_for_sip_numbers(ctx)
     if trunk_to:
         resp = await asyncio.to_thread(
             _post_internal_json,
@@ -333,7 +351,12 @@ async def entrypoint(ctx: JobContext):
             call_id_from_internal = str(resp.get("callId"))
             prompt_from_internal = resp.get("prompt") if isinstance(resp.get("prompt"), str) else None
             welcome_from_internal = resp.get("welcome") if isinstance(resp.get("welcome"), dict) else None
-            logger.info(f"Telephony call linked: callId={call_id_from_internal} to={trunk_to} from={caller_from}")
+            logger.info(
+                f"Telephony call linked: callId={call_id_from_internal} to={trunk_to} from={caller_from} "
+                f"promptChars={len(prompt_from_internal or '')} welcomeMode={str((welcome_from_internal or {}).get('mode') or '')}"
+            )
+        else:
+            logger.warning(f"Telephony internal start failed (no callId). to={trunk_to} from={caller_from} resp={resp}")
 
     async def log_usage():
         summary = usage_collector.get_summary()
