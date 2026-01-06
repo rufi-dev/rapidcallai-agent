@@ -77,14 +77,69 @@ def _post_call_metrics(call_id: str, payload: dict) -> None:
     base = os.environ.get("SERVER_BASE_URL", "").strip().rstrip("/")
     if not base:
         return
+    secret = os.environ.get("AGENT_SHARED_SECRET", "").strip()
     url = f"{base}/api/calls/{call_id}/metrics"
     body = json.dumps(payload).encode("utf-8")
-    req = urlrequest.Request(url, data=body, headers={"content-type": "application/json"}, method="POST")
+    headers = {"content-type": "application/json"}
+    if secret:
+        headers["x-agent-secret"] = secret
+    req = urlrequest.Request(url, data=body, headers=headers, method="POST")
     try:
         with urlrequest.urlopen(req, timeout=5) as resp:
             _ = resp.read()
     except (HTTPError, URLError) as e:
         logger.warning(f"Failed to post call metrics: {e}")
+
+
+def _post_internal_json(path: str, payload: dict) -> dict | None:
+    base = os.environ.get("SERVER_BASE_URL", "").strip().rstrip("/")
+    if not base:
+        return None
+    secret = os.environ.get("AGENT_SHARED_SECRET", "").strip()
+    if not secret:
+        logger.warning("AGENT_SHARED_SECRET not set; cannot call internal API")
+        return None
+    url = f"{base}{path}"
+    body = json.dumps(payload).encode("utf-8")
+    req = urlrequest.Request(
+        url,
+        data=body,
+        headers={"content-type": "application/json", "x-agent-secret": secret},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw) if raw else {}
+    except (HTTPError, URLError) as e:
+        logger.warning(f"Internal API call failed {path}: {e}")
+        return None
+
+
+def _extract_sip_numbers(ctx: JobContext) -> tuple[str | None, str | None]:
+    """
+    Attempt to read SIP participant attributes provided by LiveKit Telephony.
+    Docs: https://docs.livekit.io/reference/telephony/sip-participant/
+    """
+    try:
+        parts = getattr(ctx.room, "remote_participants", None) or {}
+        vals = parts.values() if hasattr(parts, "values") else []
+    except Exception:
+        vals = []
+
+    trunk_number = None
+    caller_number = None
+    for p in vals:
+        attrs = getattr(p, "attributes", None) or {}
+        if not isinstance(attrs, dict):
+            continue
+        trunk_number = trunk_number or attrs.get("sip.trunkPhoneNumber")
+        caller_number = caller_number or attrs.get("sip.phoneNumber")
+        if trunk_number or caller_number:
+            # keep scanning in case one is missing
+            pass
+
+    return trunk_number, caller_number
 
 
 class MyAgent(Agent):
@@ -200,6 +255,40 @@ async def entrypoint(ctx: JobContext):
     def on_user_input_transcribed(ev):
         logger.info(f"User transcript ({'final' if ev.is_final else 'partial'}): {ev.transcript}")
 
+    transcript_items: list[dict] = []
+
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed_capture(ev):
+        # Capture only final segments to keep transcript clean.
+        if not getattr(ev, "is_final", False):
+            return
+        txt = str(getattr(ev, "transcript", "") or "").strip()
+        if not txt:
+            return
+        transcript_items.append(
+            {
+                "speaker": "User",
+                "role": "user",
+                "text": txt,
+                "final": True,
+            }
+        )
+
+    # Best-effort capture of agent output (event name may vary by SDK version).
+    @session.on("agent_output_transcribed")
+    def on_agent_output_transcribed_capture(ev):
+        txt = str(getattr(ev, "transcript", "") or getattr(ev, "text", "") or "").strip()
+        if not txt:
+            return
+        transcript_items.append(
+            {
+                "speaker": "Agent",
+                "role": "agent",
+                "text": txt,
+                "final": True,
+            }
+        )
+
     usage_collector = metrics.UsageCollector()
     llm_ttft_ms_sum = 0.0
     llm_ttft_count = 0
@@ -224,11 +313,29 @@ async def entrypoint(ctx: JobContext):
             eou_end_ms_sum += float(ev.metrics.end_of_utterance_delay) * 1000.0
             eou_end_count += 1
 
+    # If this is a telephony call, create a call record and fetch the agent prompt via internal API.
+    call_id_from_internal: str | None = None
+    prompt_from_internal: str | None = None
+    welcome_from_internal: dict | None = None
+
+    trunk_to, caller_from = _extract_sip_numbers(ctx)
+    if trunk_to:
+        resp = await asyncio.to_thread(
+            _post_internal_json,
+            "/api/internal/telephony/inbound/start",
+            {"roomName": ctx.room.name, "to": str(trunk_to), "from": str(caller_from or "")},
+        )
+        if isinstance(resp, dict) and resp.get("callId"):
+            call_id_from_internal = str(resp.get("callId"))
+            prompt_from_internal = resp.get("prompt") if isinstance(resp.get("prompt"), str) else None
+            welcome_from_internal = resp.get("welcome") if isinstance(resp.get("welcome"), dict) else None
+            logger.info(f"Telephony call linked: callId={call_id_from_internal} to={trunk_to} from={caller_from}")
+
     async def log_usage():
         summary = usage_collector.get_summary()
         logger.info(f"Usage: {summary}")
 
-        call_id = _extract_call_id_from_room(ctx)
+        call_id = call_id_from_internal or _extract_call_id_from_room(ctx)
         if not call_id:
             return
 
@@ -253,8 +360,20 @@ async def entrypoint(ctx: JobContext):
 
     ctx.add_shutdown_callback(log_usage)
 
-    extra_prompt = _extract_prompt_from_room(ctx)
-    welcome = _extract_welcome_from_room(ctx)
+    extra_prompt = prompt_from_internal or _extract_prompt_from_room(ctx)
+    welcome = welcome_from_internal or _extract_welcome_from_room(ctx)
+
+    async def finalize_call():
+        call_id = call_id_from_internal or _extract_call_id_from_room(ctx)
+        if not call_id:
+            return
+        await asyncio.to_thread(
+            _post_internal_json,
+            f"/api/internal/calls/{call_id}/end",
+            {"outcome": "completed", "transcript": transcript_items},
+        )
+
+    ctx.add_shutdown_callback(finalize_call)
     await session.start(
         agent=MyAgent(extra_prompt=extra_prompt, welcome=welcome),
         room=ctx.room,
