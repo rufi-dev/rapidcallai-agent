@@ -322,14 +322,68 @@ async def _entrypoint_impl(ctx: JobContext):
     # Ensure we are connected and have up-to-date room metadata / participant linkage.
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    # Allow per-agent voice config from room metadata (set by the dashboard).
+    # Telephony rooms are created by LiveKit SIP/dispatch rules (not by our API),
+    # so they usually DO NOT carry the agent config in room metadata.
+    # For web rooms, our API embeds prompt/welcome/voice in room metadata.
+    call_id_from_internal: str | None = None
+    prompt_from_internal: str | None = None
+    welcome_from_internal: dict | None = None
+    agent_name_from_internal: str | None = None
+    voice_from_internal: dict | None = None
+
+    prompt_from_room = _extract_prompt_from_room(ctx)
+    welcome_from_room = _extract_welcome_from_room(ctx)
+    agent_name_from_room = _extract_agent_name_from_room(ctx)
+
+    # Only wait for SIP attrs if we don't already have a prompt in room metadata.
+    trunk_to, caller_from = (None, None)
+    if not prompt_from_room:
+        trunk_to, caller_from = await _wait_for_sip_numbers(ctx)
+        if trunk_to:
+            resp = await asyncio.to_thread(
+                _post_internal_json,
+                "/api/internal/telephony/inbound/start",
+                {"roomName": ctx.room.name, "to": str(trunk_to), "from": str(caller_from or "")},
+            )
+            if isinstance(resp, dict) and resp.get("callId"):
+                call_id_from_internal = str(resp.get("callId"))
+                prompt_from_internal = resp.get("prompt") if isinstance(resp.get("prompt"), str) else None
+                welcome_from_internal = resp.get("welcome") if isinstance(resp.get("welcome"), dict) else None
+                agent_name_from_internal = (
+                    (resp.get("agent") or {}).get("name") if isinstance(resp.get("agent"), dict) else None
+                )
+                voice_from_internal = resp.get("voice") if isinstance(resp.get("voice"), dict) else None
+                logger.info(
+                    f"Telephony call linked: callId={call_id_from_internal} to={trunk_to} from={caller_from} "
+                    f"promptChars={len(prompt_from_internal or '')} welcomeMode={str((welcome_from_internal or {}).get('mode') or '')}"
+                )
+            elif trunk_to:
+                logger.warning(
+                    f"Telephony internal start failed (no callId). to={trunk_to} from={caller_from} resp={resp}"
+                )
+
+    extra_prompt = prompt_from_internal or prompt_from_room
+    welcome = welcome_from_internal or welcome_from_room
+    agent_speaker = (agent_name_from_internal or agent_name_from_room or "Agent").strip()
+
+    # Allow per-agent voice config from:
+    # 1) room metadata (web sessions)
+    # 2) internal telephony response (phone calls)
     tts_obj = ctx.proc.userdata.get("tts")
     try:
-        import json as _json
         import inspect as _inspect
 
-        meta = _json.loads(ctx.room.metadata or "{}") if getattr(ctx.room, "metadata", None) else {}
-        voice_cfg = (meta.get("agent") or {}).get("voice") or {}
+        voice_cfg = {}
+        if getattr(ctx.room, "metadata", None):
+            try:
+                meta = json.loads(ctx.room.metadata or "{}")
+                voice_cfg = (meta.get("agent") or {}).get("voice") or {}
+            except Exception:
+                voice_cfg = {}
+
+        if not voice_cfg and isinstance(voice_from_internal, dict):
+            voice_cfg = voice_from_internal
+
         provider = str(voice_cfg.get("provider") or "").strip().lower()
         model = str(voice_cfg.get("model") or "").strip()
         voice_id = str(voice_cfg.get("voiceId") or "").strip()
@@ -340,25 +394,28 @@ async def _entrypoint_impl(ctx: JobContext):
                 voice=voice_id,
                 text_pacing=True,
             )
-        elif provider == "elevenlabs" and voice_id and elevenlabs is not None:
-            # Build ElevenLabs TTS using best-effort constructor args.
-            cls = getattr(elevenlabs, "TTS", None)
-            if cls is not None:
-                sig = _inspect.signature(cls.__init__)
-                kwargs = {}
-                if "model" in sig.parameters:
-                    kwargs["model"] = model or "eleven_multilingual_v2"
-                elif "model_id" in sig.parameters:
-                    kwargs["model_id"] = model or "eleven_multilingual_v2"
-                if "voice" in sig.parameters:
-                    kwargs["voice"] = voice_id
-                elif "voice_id" in sig.parameters:
-                    kwargs["voice_id"] = voice_id
-                elif "voiceId" in sig.parameters:
-                    kwargs["voiceId"] = voice_id
-                tts_obj = cls(**kwargs)
+        elif provider == "elevenlabs" and voice_id:
+            if elevenlabs is None:
+                logger.warning("Voice provider is elevenlabs but plugin is not installed; using default TTS.")
+            else:
+                # Build ElevenLabs TTS using best-effort constructor args.
+                cls = getattr(elevenlabs, "TTS", None)
+                if cls is not None:
+                    sig = _inspect.signature(cls.__init__)
+                    kwargs = {}
+                    if "model" in sig.parameters:
+                        kwargs["model"] = model or "eleven_multilingual_v2"
+                    elif "model_id" in sig.parameters:
+                        kwargs["model_id"] = model or "eleven_multilingual_v2"
+                    if "voice" in sig.parameters:
+                        kwargs["voice"] = voice_id
+                    elif "voice_id" in sig.parameters:
+                        kwargs["voice_id"] = voice_id
+                    elif "voiceId" in sig.parameters:
+                        kwargs["voiceId"] = voice_id
+                    tts_obj = cls(**kwargs)
     except Exception:
-        # Never fail the call because of a voice config/metadata issue.
+        # Never fail the call because of a voice config issue.
         pass
 
     session = AgentSession(
@@ -474,32 +531,7 @@ async def _entrypoint_impl(ctx: JobContext):
             eou_end_ms_sum += float(ev.metrics.end_of_utterance_delay) * 1000.0
             eou_end_count += 1
 
-    # If this is a telephony call, create a call record and fetch the agent prompt via internal API.
-    call_id_from_internal: str | None = None
-    prompt_from_internal: str | None = None
-    welcome_from_internal: dict | None = None
-    agent_name_from_internal: str | None = None
-
-    trunk_to, caller_from = await _wait_for_sip_numbers(ctx)
-    if trunk_to:
-        resp = await asyncio.to_thread(
-            _post_internal_json,
-            "/api/internal/telephony/inbound/start",
-            {"roomName": ctx.room.name, "to": str(trunk_to), "from": str(caller_from or "")},
-        )
-        if isinstance(resp, dict) and resp.get("callId"):
-            call_id_from_internal = str(resp.get("callId"))
-            prompt_from_internal = resp.get("prompt") if isinstance(resp.get("prompt"), str) else None
-            welcome_from_internal = resp.get("welcome") if isinstance(resp.get("welcome"), dict) else None
-            agent_name_from_internal = (
-                (resp.get("agent") or {}).get("name") if isinstance(resp.get("agent"), dict) else None
-            )
-            logger.info(
-                f"Telephony call linked: callId={call_id_from_internal} to={trunk_to} from={caller_from} "
-                f"promptChars={len(prompt_from_internal or '')} welcomeMode={str((welcome_from_internal or {}).get('mode') or '')}"
-            )
-        else:
-            logger.warning(f"Telephony internal start failed (no callId). to={trunk_to} from={caller_from} resp={resp}")
+    # Telephony setup + voice selection happens before AgentSession init (above).
 
     async def log_usage():
         summary = usage_collector.get_summary()
@@ -530,9 +562,7 @@ async def _entrypoint_impl(ctx: JobContext):
 
     ctx.add_shutdown_callback(log_usage)
 
-    extra_prompt = prompt_from_internal or _extract_prompt_from_room(ctx)
-    welcome = welcome_from_internal or _extract_welcome_from_room(ctx)
-    agent_speaker = (agent_name_from_internal or _extract_agent_name_from_room(ctx) or "Agent").strip()
+    # extra_prompt / welcome / agent_speaker are computed before session init (above).
 
     async def finalize_call():
         call_id = call_id_from_internal or _extract_call_id_from_room(ctx)
