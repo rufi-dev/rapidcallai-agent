@@ -91,6 +91,18 @@ def _extract_call_id_from_room(ctx: JobContext) -> str | None:
     return call_id if isinstance(call_id, str) and call_id.strip() else None
 
 
+def _extract_agent_name_from_room(ctx: JobContext) -> str | None:
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    name = data.get("agent", {}).get("name") if isinstance(data, dict) else None
+    return name if isinstance(name, str) and name.strip() else None
+
+
 def _post_call_metrics(call_id: str, payload: dict) -> None:
     base = os.environ.get("SERVER_BASE_URL", "").strip().rstrip("/")
     if not base:
@@ -355,15 +367,38 @@ async def _entrypoint_impl(ctx: JobContext):
             }
         )
 
-    # Best-effort capture of agent output (event name may vary by SDK version).
-    @session.on("agent_output_transcribed")
-    def on_agent_output_transcribed_capture(ev):
-        txt = str(getattr(ev, "transcript", "") or getattr(ev, "text", "") or "").strip()
+    # Capture agent output using the documented event type in this SDK version.
+    # `conversation_item_added` emits ChatMessage items for both user + assistant;
+    # we only persist assistant messages here.
+    _last_agent_text: str | None = None
+
+    @session.on("conversation_item_added")
+    def on_conversation_item_added_capture(ev):
+        nonlocal _last_agent_text
+        item = getattr(ev, "item", None)
+        if not item:
+            return
+        role = getattr(item, "role", None)
+        if role != "assistant":
+            return
+
+        txt = getattr(item, "text_content", None)
+        if not txt:
+            content = getattr(item, "content", None)
+            if isinstance(content, list):
+                parts = [c for c in content if isinstance(c, str)]
+                txt = "\n".join(parts) if parts else None
+
+        txt = str(txt or "").strip()
         if not txt:
             return
+        if _last_agent_text == txt:
+            return
+        _last_agent_text = txt
+
         transcript_items.append(
             {
-                "speaker": "Agent",
+                "speaker": agent_speaker,
                 "role": "agent",
                 "text": txt,
                 "final": True,
@@ -398,6 +433,7 @@ async def _entrypoint_impl(ctx: JobContext):
     call_id_from_internal: str | None = None
     prompt_from_internal: str | None = None
     welcome_from_internal: dict | None = None
+    agent_name_from_internal: str | None = None
 
     trunk_to, caller_from = await _wait_for_sip_numbers(ctx)
     if trunk_to:
@@ -410,6 +446,9 @@ async def _entrypoint_impl(ctx: JobContext):
             call_id_from_internal = str(resp.get("callId"))
             prompt_from_internal = resp.get("prompt") if isinstance(resp.get("prompt"), str) else None
             welcome_from_internal = resp.get("welcome") if isinstance(resp.get("welcome"), dict) else None
+            agent_name_from_internal = (
+                (resp.get("agent") or {}).get("name") if isinstance(resp.get("agent"), dict) else None
+            )
             logger.info(
                 f"Telephony call linked: callId={call_id_from_internal} to={trunk_to} from={caller_from} "
                 f"promptChars={len(prompt_from_internal or '')} welcomeMode={str((welcome_from_internal or {}).get('mode') or '')}"
@@ -448,6 +487,7 @@ async def _entrypoint_impl(ctx: JobContext):
 
     extra_prompt = prompt_from_internal or _extract_prompt_from_room(ctx)
     welcome = welcome_from_internal or _extract_welcome_from_room(ctx)
+    agent_speaker = (agent_name_from_internal or _extract_agent_name_from_room(ctx) or "Agent").strip()
 
     async def finalize_call():
         call_id = call_id_from_internal or _extract_call_id_from_room(ctx)
