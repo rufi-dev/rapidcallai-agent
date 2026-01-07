@@ -371,8 +371,6 @@ async def _entrypoint_impl(ctx: JobContext):
     # 2) internal telephony response (phone calls)
     tts_obj = ctx.proc.userdata.get("tts")
     try:
-        import inspect as _inspect
-
         voice_cfg = {}
         if getattr(ctx.room, "metadata", None):
             try:
@@ -398,22 +396,16 @@ async def _entrypoint_impl(ctx: JobContext):
             if elevenlabs is None:
                 logger.warning("Voice provider is elevenlabs but plugin is not installed; using default TTS.")
             else:
-                # Build ElevenLabs TTS using best-effort constructor args.
-                cls = getattr(elevenlabs, "TTS", None)
-                if cls is not None:
-                    sig = _inspect.signature(cls.__init__)
-                    kwargs = {}
-                    if "model" in sig.parameters:
-                        kwargs["model"] = model or "eleven_multilingual_v2"
-                    elif "model_id" in sig.parameters:
-                        kwargs["model_id"] = model or "eleven_multilingual_v2"
-                    if "voice" in sig.parameters:
-                        kwargs["voice"] = voice_id
-                    elif "voice_id" in sig.parameters:
-                        kwargs["voice_id"] = voice_id
-                    elif "voiceId" in sig.parameters:
-                        kwargs["voiceId"] = voice_id
-                    tts_obj = cls(**kwargs)
+                # ElevenLabs plugin expects api_key via arg or ELEVEN_API_KEY env var.
+                api_key = (
+                    os.environ.get("ELEVEN_API_KEY", "").strip()
+                    or os.environ.get("ELEVENLABS_API_KEY", "").strip()
+                    or None
+                )
+                if api_key:
+                    tts_obj = elevenlabs.TTS(voice_id=voice_id, model=model or "eleven_turbo_v2_5", api_key=api_key)
+                else:
+                    tts_obj = elevenlabs.TTS(voice_id=voice_id, model=model or "eleven_turbo_v2_5")
     except Exception:
         # Never fail the call because of a voice config issue.
         pass
