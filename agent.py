@@ -330,6 +330,7 @@ async def _entrypoint_impl(ctx: JobContext):
     welcome_from_internal: dict | None = None
     agent_name_from_internal: str | None = None
     voice_from_internal: dict | None = None
+    telephony_trunk_to: str | None = None
 
     prompt_from_room = _extract_prompt_from_room(ctx)
     welcome_from_room = _extract_welcome_from_room(ctx)
@@ -340,6 +341,7 @@ async def _entrypoint_impl(ctx: JobContext):
     if not prompt_from_room:
         trunk_to, caller_from = await _wait_for_sip_numbers(ctx)
         if trunk_to:
+            telephony_trunk_to = str(trunk_to)
             resp = await asyncio.to_thread(
                 _post_internal_json,
                 "/api/internal/telephony/inbound/start",
@@ -556,10 +558,16 @@ async def _entrypoint_impl(ctx: JobContext):
 
     # extra_prompt / welcome / agent_speaker are computed before session init (above).
 
+    _finalized = False
+
     async def finalize_call():
+        nonlocal _finalized
+        if _finalized:
+            return
         call_id = call_id_from_internal or _extract_call_id_from_room(ctx)
         if not call_id:
             return
+        _finalized = True
         await asyncio.to_thread(
             _post_internal_json,
             f"/api/internal/calls/{call_id}/end",
@@ -567,6 +575,39 @@ async def _entrypoint_impl(ctx: JobContext):
         )
 
     ctx.add_shutdown_callback(finalize_call)
+
+    async def watch_sip_hangup():
+        """
+        LiveKit SIP rooms can stay alive briefly after the caller hangs up.
+        To avoid "extra 30s" call duration, detect SIP participant leaving and shut down immediately.
+        """
+        if not telephony_trunk_to:
+            return
+        # Wait until we actually see SIP attrs at least once (otherwise we may be too early).
+        seen = False
+        consecutive_missing = 0
+        while True:
+            if _finalized:
+                return
+            t, f = _extract_sip_numbers(ctx)
+            if t or f:
+                seen = True
+                consecutive_missing = 0
+            else:
+                if seen:
+                    consecutive_missing += 1
+                    # Require two consecutive misses to avoid transient reads.
+                    if consecutive_missing >= 2:
+                        try:
+                            await finalize_call()
+                        finally:
+                            # End the job now; don't wait for room empty timeout.
+                            ctx.shutdown("sip hangup")
+                        return
+            await asyncio.sleep(0.4)
+
+    # Start hangup watcher only for telephony calls.
+    asyncio.create_task(watch_sip_hangup(), name="watch_sip_hangup")
     await session.start(
         agent=MyAgent(extra_prompt=extra_prompt, welcome=welcome),
         room=ctx.room,
