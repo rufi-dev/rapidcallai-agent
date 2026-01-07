@@ -190,6 +190,37 @@ def _extract_sip_numbers(ctx: JobContext) -> tuple[str | None, str | None]:
     return trunk_number, caller_number
 
 
+def _extract_sip_call_sid(ctx: JobContext) -> str | None:
+    """
+    Best-effort extraction of provider call id from LiveKit SIP participant attributes.
+    Depending on the provider/bridge, this may or may not be present.
+    """
+    try:
+        parts = getattr(ctx.room, "remote_participants", None) or {}
+        vals = parts.values() if hasattr(parts, "values") else []
+    except Exception:
+        vals = []
+
+    for p in vals:
+        attrs = getattr(p, "attributes", None) or {}
+        if not isinstance(attrs, dict):
+            continue
+        # Try common keys (case-insensitive)
+        for k, v in attrs.items():
+            if not isinstance(k, str):
+                continue
+            key = k.strip().lower()
+            if key in ("sip.callid", "sip.call_id", "sip.callsid", "sip.twiliocallsid", "twilio.callsid"):
+                vv = str(v or "").strip()
+                if vv:
+                    return vv
+            if "callsid" in key or (key.startswith("sip.") and "call" in key and "id" in key):
+                vv = str(v or "").strip()
+                if vv:
+                    return vv
+    return None
+
+
 async def _wait_for_sip_numbers(ctx: JobContext, *, timeout_s: float = 6.0) -> tuple[str | None, str | None]:
     """
     In telephony rooms, the SIP participant may join slightly after we connect.
@@ -360,10 +391,16 @@ async def _entrypoint_impl(ctx: JobContext):
         trunk_to, caller_from = await _wait_for_sip_numbers(ctx)
         if trunk_to:
             telephony_trunk_to = str(trunk_to)
+            sip_call_sid = _extract_sip_call_sid(ctx)
             resp = await asyncio.to_thread(
                 _post_internal_json,
                 "/api/internal/telephony/inbound/start",
-                {"roomName": ctx.room.name, "to": str(trunk_to), "from": str(caller_from or "")},
+                {
+                    "roomName": ctx.room.name,
+                    "to": str(trunk_to),
+                    "from": str(caller_from or ""),
+                    "twilioCallSid": str(sip_call_sid or ""),
+                },
             )
             if isinstance(resp, dict) and resp.get("callId"):
                 call_id_from_internal = str(resp.get("callId"))
@@ -541,6 +578,31 @@ async def _entrypoint_impl(ctx: JobContext):
     eou_end_ms_sum = 0.0
     eou_end_count = 0
 
+    # Participant count sampling (for participant-min billing).
+    participant_counts: list[int] = []
+
+    async def sample_participants():
+        # Sample until shutdown; cheap, once per second.
+        while True:
+            try:
+                rem = getattr(ctx.room, "remote_participants", None) or {}
+                n_remote = len(rem) if hasattr(rem, "__len__") else 0
+            except Exception:
+                n_remote = 0
+            # Count agent + remote participants
+            participant_counts.append(max(1, 1 + int(n_remote)))
+            await asyncio.sleep(1.0)
+
+    sampler_task = asyncio.create_task(sample_participants())
+
+    async def _stop_sampler():
+        try:
+            sampler_task.cancel()
+        except Exception:
+            pass
+
+    ctx.add_shutdown_callback(_stop_sampler)
+
     @session.on("metrics_collected")
     def on_metrics_collected(ev: MetricsCollectedEvent):
         metrics.log_metrics(ev.metrics)
@@ -575,6 +637,27 @@ async def _entrypoint_impl(ctx: JobContext):
         if eou_transcription_ms_avg is not None and llm_ttft_ms_avg is not None:
             agent_turn_latency_ms_avg = eou_transcription_ms_avg + llm_ttft_ms_avg
 
+        participants_count_avg: float | None = None
+        if participant_counts:
+            try:
+                participants_count_avg = float(sum(participant_counts)) / float(len(participant_counts))
+            except Exception:
+                participants_count_avg = None
+
+        source = "telephony" if call_id_from_internal else "web"
+
+        normalized_payload: dict = {"source": source}
+        if participants_count_avg is not None and participants_count_avg > 0:
+            normalized_payload["participantsCountAvg"] = participants_count_avg
+
+        telephony_payload: dict = {
+            "trunkNumber": str(telephony_trunk_to or ""),
+            "callerNumber": str(caller_from or ""),
+        }
+        sid = str(_extract_sip_call_sid(ctx) or "").strip()
+        if sid:
+            telephony_payload["twilioCallSid"] = sid
+
         payload = {
             "usage": asdict(summary),
             "latency": {
@@ -583,6 +666,8 @@ async def _entrypoint_impl(ctx: JobContext):
                 "eou_end_ms_avg": eou_end_ms_avg,
                 "agent_turn_latency_ms_avg": agent_turn_latency_ms_avg,
             },
+            "normalized": normalized_payload,
+            "telephony": telephony_payload,
         }
         payload["models"] = {}
         if llm_model_used:
