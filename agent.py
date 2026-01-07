@@ -109,6 +109,18 @@ def _extract_agent_name_from_room(ctx: JobContext) -> str | None:
     return name if isinstance(name, str) and name.strip() else None
 
 
+def _extract_llm_model_from_room(ctx: JobContext) -> str | None:
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    m = data.get("agent", {}).get("llmModel") if isinstance(data, dict) else None
+    return m if isinstance(m, str) and m.strip() else None
+
+
 def _post_call_metrics(call_id: str, payload: dict) -> None:
     base = os.environ.get("SERVER_BASE_URL", "").strip().rstrip("/")
     if not base:
@@ -330,11 +342,13 @@ async def _entrypoint_impl(ctx: JobContext):
     welcome_from_internal: dict | None = None
     agent_name_from_internal: str | None = None
     voice_from_internal: dict | None = None
+    llm_model_from_internal: str | None = None
     telephony_trunk_to: str | None = None
 
     prompt_from_room = _extract_prompt_from_room(ctx)
     welcome_from_room = _extract_welcome_from_room(ctx)
     agent_name_from_room = _extract_agent_name_from_room(ctx)
+    llm_model_from_room = _extract_llm_model_from_room(ctx)
 
     # Only wait for SIP attrs if we don't already have a prompt in room metadata.
     trunk_to, caller_from = (None, None)
@@ -355,6 +369,7 @@ async def _entrypoint_impl(ctx: JobContext):
                     (resp.get("agent") or {}).get("name") if isinstance(resp.get("agent"), dict) else None
                 )
                 voice_from_internal = resp.get("voice") if isinstance(resp.get("voice"), dict) else None
+                llm_model_from_internal = resp.get("llmModel") if isinstance(resp.get("llmModel"), str) else None
                 logger.info(
                     f"Telephony call linked: callId={call_id_from_internal} to={trunk_to} from={caller_from} "
                     f"promptChars={len(prompt_from_internal or '')} welcomeMode={str((welcome_from_internal or {}).get('mode') or '')}"
@@ -367,6 +382,15 @@ async def _entrypoint_impl(ctx: JobContext):
     extra_prompt = prompt_from_internal or prompt_from_room
     welcome = welcome_from_internal or welcome_from_room
     agent_speaker = (agent_name_from_internal or agent_name_from_room or "Agent").strip()
+    llm_model_used = (llm_model_from_internal or llm_model_from_room or "").strip() or None
+
+    llm_obj = ctx.proc.userdata.get("llm")
+    try:
+        if llm_model_used:
+            llm_obj = openai.LLM(model=llm_model_used)
+    except Exception:
+        # Never fail the call because of an LLM model config issue.
+        llm_obj = ctx.proc.userdata.get("llm")
 
     # Allow per-agent voice config from:
     # 1) room metadata (web sessions)
@@ -415,7 +439,7 @@ async def _entrypoint_impl(ctx: JobContext):
     session = AgentSession(
         # Use provider plugins directly (avoids LiveKit hosted inference quota).
         stt=ctx.proc.userdata.get("stt"),
-        llm=ctx.proc.userdata.get("llm"),
+        llm=llm_obj,
         tts=tts_obj,
         vad=ctx.proc.userdata["vad"],
         # Reduce audio "cutting" caused by aggressive interruption detection in noisy rooms.
@@ -552,6 +576,8 @@ async def _entrypoint_impl(ctx: JobContext):
                 "agent_turn_latency_ms_avg": agent_turn_latency_ms_avg,
             },
         }
+        if llm_model_used:
+            payload["models"] = {"llm": llm_model_used}
         await asyncio.to_thread(_post_call_metrics, call_id, payload)
 
     ctx.add_shutdown_callback(log_usage)
@@ -577,10 +603,6 @@ async def _entrypoint_impl(ctx: JobContext):
     ctx.add_shutdown_callback(finalize_call)
 
     async def watch_sip_hangup():
-        """
-        LiveKit SIP rooms can stay alive briefly after the caller hangs up.
-        To avoid "extra 30s" call duration, detect SIP participant leaving and shut down immediately.
-        """
         if not telephony_trunk_to:
             return
         # Wait until we actually see SIP attrs at least once (otherwise we may be too early).
