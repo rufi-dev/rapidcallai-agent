@@ -25,6 +25,12 @@ from livekit.agents.llm import function_tool
 from livekit.agents import inference
 from livekit.plugins import cartesia, deepgram, openai, silero
 
+try:
+    # Optional: only present if you add livekit-plugins-elevenlabs
+    from livekit.plugins import elevenlabs  # type: ignore
+except Exception:  # pragma: no cover
+    elevenlabs = None  # type: ignore
+
 load_dotenv()
 logger = logging.getLogger("basic-agent")
 
@@ -316,11 +322,50 @@ async def _entrypoint_impl(ctx: JobContext):
     # Ensure we are connected and have up-to-date room metadata / participant linkage.
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
+    # Allow per-agent voice config from room metadata (set by the dashboard).
+    tts_obj = ctx.proc.userdata.get("tts")
+    try:
+        import json as _json
+        import inspect as _inspect
+
+        meta = _json.loads(ctx.room.metadata or "{}") if getattr(ctx.room, "metadata", None) else {}
+        voice_cfg = (meta.get("agent") or {}).get("voice") or {}
+        provider = str(voice_cfg.get("provider") or "").strip().lower()
+        model = str(voice_cfg.get("model") or "").strip()
+        voice_id = str(voice_cfg.get("voiceId") or "").strip()
+
+        if provider == "cartesia" and voice_id:
+            tts_obj = cartesia.TTS(
+                model=model or os.environ.get("CARTESIA_TTS_MODEL", "sonic-2"),
+                voice=voice_id,
+                text_pacing=True,
+            )
+        elif provider == "elevenlabs" and voice_id and elevenlabs is not None:
+            # Build ElevenLabs TTS using best-effort constructor args.
+            cls = getattr(elevenlabs, "TTS", None)
+            if cls is not None:
+                sig = _inspect.signature(cls.__init__)
+                kwargs = {}
+                if "model" in sig.parameters:
+                    kwargs["model"] = model or "eleven_multilingual_v2"
+                elif "model_id" in sig.parameters:
+                    kwargs["model_id"] = model or "eleven_multilingual_v2"
+                if "voice" in sig.parameters:
+                    kwargs["voice"] = voice_id
+                elif "voice_id" in sig.parameters:
+                    kwargs["voice_id"] = voice_id
+                elif "voiceId" in sig.parameters:
+                    kwargs["voiceId"] = voice_id
+                tts_obj = cls(**kwargs)
+    except Exception:
+        # Never fail the call because of a voice config/metadata issue.
+        pass
+
     session = AgentSession(
         # Use provider plugins directly (avoids LiveKit hosted inference quota).
         stt=ctx.proc.userdata.get("stt"),
         llm=ctx.proc.userdata.get("llm"),
-        tts=ctx.proc.userdata.get("tts"),
+        tts=tts_obj,
         vad=ctx.proc.userdata["vad"],
         # Reduce audio "cutting" caused by aggressive interruption detection in noisy rooms.
         # Console mode feels smoother because it doesn't have RTC echo/noise artifacts.
