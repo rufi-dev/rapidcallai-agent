@@ -297,6 +297,7 @@ def prewarm(proc: JobProcess):
             model=os.environ.get("LK_STT_MODEL", "auto"),
             extra_kwargs={"interim_results": True},
         )
+        proc.userdata["stt_model_name"] = f"livekit/{os.environ.get('LK_STT_MODEL', 'auto')}"
     else:
         proc.userdata["stt"] = deepgram.STT(
             model=os.environ.get("DEEPGRAM_STT_MODEL", "nova-3"),
@@ -307,6 +308,7 @@ def prewarm(proc: JobProcess):
             punctuate=True,
             filler_words=True,
         )
+        proc.userdata["stt_model_name"] = f"deepgram/{os.environ.get('DEEPGRAM_STT_MODEL', 'nova-3')}"
     proc.userdata["llm"] = openai.LLM(model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4.1-mini"))
     # TTS backend:
     # - livekit: LiveKit Inference Gateway
@@ -317,12 +319,14 @@ def prewarm(proc: JobProcess):
             model=os.environ.get("LK_TTS_MODEL", "cartesia/sonic-2"),
             voice=os.environ.get("LK_TTS_VOICE", ""),
         )
+        proc.userdata["tts_model_name"] = f"livekit/{os.environ.get('LK_TTS_MODEL', 'cartesia/sonic-2')}"
     else:
         proc.userdata["tts"] = cartesia.TTS(
             model=os.environ.get("CARTESIA_TTS_MODEL", "sonic-2"),
             voice=os.environ.get("CARTESIA_VOICE", "a0e99841-438c-4a64-b679-ae501e7d6091"),
             text_pacing=True,
         )
+        proc.userdata["tts_model_name"] = f"cartesia/{os.environ.get('CARTESIA_TTS_MODEL', 'sonic-2')}"
 
 
 server.setup_fnc = prewarm
@@ -396,6 +400,7 @@ async def _entrypoint_impl(ctx: JobContext):
     # 1) room metadata (web sessions)
     # 2) internal telephony response (phone calls)
     tts_obj = ctx.proc.userdata.get("tts")
+    tts_model_used = str(ctx.proc.userdata.get("tts_model_name") or "")
     try:
         voice_cfg = {}
         if getattr(ctx.room, "metadata", None):
@@ -413,6 +418,7 @@ async def _entrypoint_impl(ctx: JobContext):
         voice_id = str(voice_cfg.get("voiceId") or "").strip()
 
         if provider == "cartesia" and voice_id:
+            tts_model_used = f"cartesia/{model or os.environ.get('CARTESIA_TTS_MODEL', 'sonic-2')}"
             tts_obj = cartesia.TTS(
                 model=model or os.environ.get("CARTESIA_TTS_MODEL", "sonic-2"),
                 voice=voice_id,
@@ -429,8 +435,10 @@ async def _entrypoint_impl(ctx: JobContext):
                     or None
                 )
                 if api_key:
+                    tts_model_used = f"elevenlabs/{model or 'eleven_turbo_v2_5'}"
                     tts_obj = elevenlabs.TTS(voice_id=voice_id, model=model or "eleven_turbo_v2_5", api_key=api_key)
                 else:
+                    tts_model_used = f"elevenlabs/{model or 'eleven_turbo_v2_5'}"
                     tts_obj = elevenlabs.TTS(voice_id=voice_id, model=model or "eleven_turbo_v2_5")
     except Exception:
         # Never fail the call because of a voice config issue.
@@ -576,8 +584,14 @@ async def _entrypoint_impl(ctx: JobContext):
                 "agent_turn_latency_ms_avg": agent_turn_latency_ms_avg,
             },
         }
+        payload["models"] = {}
         if llm_model_used:
-            payload["models"] = {"llm": llm_model_used}
+            payload["models"]["llm"] = llm_model_used
+        stt_model_used = str(ctx.proc.userdata.get("stt_model_name") or "").strip()
+        if stt_model_used:
+            payload["models"]["stt"] = stt_model_used
+        if tts_model_used:
+            payload["models"]["tts"] = tts_model_used
         await asyncio.to_thread(_post_call_metrics, call_id, payload)
 
     ctx.add_shutdown_callback(log_usage)
