@@ -411,6 +411,11 @@ async def _entrypoint_impl(ctx: JobContext):
                 )
                 voice_from_internal = resp.get("voice") if isinstance(resp.get("voice"), dict) else None
                 llm_model_from_internal = resp.get("llmModel") if isinstance(resp.get("llmModel"), str) else None
+                max_call_seconds_from_internal = (
+                    int(resp.get("maxCallSeconds"))
+                    if isinstance(resp.get("maxCallSeconds"), (int, float)) and float(resp.get("maxCallSeconds")) >= 0
+                    else None
+                )
                 logger.info(
                     f"Telephony call linked: callId={call_id_from_internal} to={trunk_to} from={caller_from} "
                     f"promptChars={len(prompt_from_internal or '')} welcomeMode={str((welcome_from_internal or {}).get('mode') or '')}"
@@ -424,6 +429,22 @@ async def _entrypoint_impl(ctx: JobContext):
     welcome = welcome_from_internal or welcome_from_room
     agent_speaker = (agent_name_from_internal or agent_name_from_room or "Agent").strip()
     llm_model_used = (llm_model_from_internal or llm_model_from_room or "").strip() or None
+
+    # Max call duration (seconds): from room metadata (web) or internal telephony response (phone).
+    max_call_seconds = 0
+    try:
+        if getattr(ctx.room, "metadata", None):
+            meta2 = json.loads(ctx.room.metadata or "{}")
+            mcs = (meta2.get("agent") or {}).get("maxCallSeconds")
+            if isinstance(mcs, (int, float)) and float(mcs) >= 0:
+                max_call_seconds = int(mcs)
+    except Exception:
+        pass
+    try:
+        if "max_call_seconds_from_internal" in locals() and max_call_seconds_from_internal is not None:
+            max_call_seconds = int(max_call_seconds_from_internal)
+    except Exception:
+        pass
 
     llm_obj = ctx.proc.userdata.get("llm")
     try:
@@ -700,6 +721,27 @@ async def _entrypoint_impl(ctx: JobContext):
         )
 
     ctx.add_shutdown_callback(finalize_call)
+
+    # Hard stop: if a call exceeds the agent-configured max duration, end it.
+    # This prevents "in_progress" calls from hanging forever.
+    async def max_duration_watcher():
+        try:
+            if max_call_seconds and max_call_seconds > 0:
+                await asyncio.sleep(float(max_call_seconds))
+                if _finalized:
+                    return
+                try:
+                    await finalize_call()
+                finally:
+                    ctx.shutdown("max_call_duration")
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # Never crash the job because of the watchdog.
+            pass
+
+    if max_call_seconds and max_call_seconds > 0:
+        asyncio.create_task(max_duration_watcher())
 
     async def watch_sip_hangup():
         if not telephony_trunk_to:
