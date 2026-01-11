@@ -281,7 +281,6 @@ class MyAgent(Agent):
             "Do not run words together. Do not read punctuation out loud."
         )
 
-        agent_name = (speaker_name or "").strip()
         kb_hint = ""
         if kb_folder_ids:
             kb_hint = (
@@ -291,20 +290,11 @@ class MyAgent(Agent):
                 "- Use the returned excerpts as evidence in your answer.\n\n"
             )
 
-        name_hint = ""
-        if agent_name:
-            name_hint = (
-                "IDENTITY:\n"
-                f"- Your name is {agent_name}.\n"
-                f"- If the user asks your name, answer exactly: My name is {agent_name}.\n\n"
-            )
-
         # IMPORTANT: Do not hardcode a persona beyond the configured name; the per-agent prompt should control behavior.
         if extra_prompt and extra_prompt.strip():
             instructions = (
                 "CUSTOM AGENT PROMPT (highest priority):\n"
                 f"{extra_prompt.strip()}\n\n"
-                f"{name_hint}"
                 f"{kb_hint}"
                 "ADDITIONAL STYLE CONSTRAINTS:\n"
                 f"{style}"
@@ -312,7 +302,6 @@ class MyAgent(Agent):
         else:
             instructions = (
                 "You are a helpful voice assistant.\n\n"
-                f"{name_hint}"
                 f"{kb_hint}"
                 "ADDITIONAL STYLE CONSTRAINTS:\n"
                 f"{style}"
