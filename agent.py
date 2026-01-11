@@ -140,7 +140,10 @@ def _extract_knowledge_folder_ids_from_room(ctx: JobContext) -> list[str]:
 
 
 def _post_call_metrics(call_id: str, payload: dict) -> None:
-    base = os.environ.get("SERVER_BASE_URL", "").strip().rstrip("/")
+    base = (
+        os.environ.get("SERVER_BASE_URL", "").strip().rstrip("/")
+        or os.environ.get("PUBLIC_API_BASE_URL", "").strip().rstrip("/")
+    )
     if not base:
         return
     secret = os.environ.get("AGENT_SHARED_SECRET", "").strip()
@@ -158,7 +161,10 @@ def _post_call_metrics(call_id: str, payload: dict) -> None:
 
 
 def _post_internal_json(path: str, payload: dict) -> dict | None:
-    base = os.environ.get("SERVER_BASE_URL", "").strip().rstrip("/")
+    base = (
+        os.environ.get("SERVER_BASE_URL", "").strip().rstrip("/")
+        or os.environ.get("PUBLIC_API_BASE_URL", "").strip().rstrip("/")
+    )
     if not base:
         return None
     secret = os.environ.get("AGENT_SHARED_SECRET", "").strip()
@@ -265,6 +271,7 @@ class MyAgent(Agent):
         welcome: dict | None = None,
         call_id: str | None = None,
         kb_folder_ids: list[str] | None = None,
+        speaker_name: str | None = None,
     ) -> None:
         style = (
             "You interact with users via voice. Keep responses concise and to the point. "
@@ -274,17 +281,39 @@ class MyAgent(Agent):
             "Do not run words together. Do not read punctuation out loud."
         )
 
-        # IMPORTANT: Do not hardcode a name/persona here; the per-agent prompt should control it.
+        agent_name = (speaker_name or "").strip()
+        kb_hint = ""
+        if kb_folder_ids:
+            kb_hint = (
+                "KNOWLEDGE BASE:\n"
+                "- You have access to a Knowledge Base via the kb_search tool.\n"
+                "- When the user asks about documents, facts, policies, or anything that could be in the Knowledge Base, call kb_search first.\n"
+                "- Use the returned excerpts as evidence in your answer.\n\n"
+            )
+
+        name_hint = ""
+        if agent_name:
+            name_hint = (
+                "IDENTITY:\n"
+                f"- Your name is {agent_name}.\n"
+                f"- If the user asks your name, answer exactly: My name is {agent_name}.\n\n"
+            )
+
+        # IMPORTANT: Do not hardcode a persona beyond the configured name; the per-agent prompt should control behavior.
         if extra_prompt and extra_prompt.strip():
             instructions = (
                 "CUSTOM AGENT PROMPT (highest priority):\n"
                 f"{extra_prompt.strip()}\n\n"
+                f"{name_hint}"
+                f"{kb_hint}"
                 "ADDITIONAL STYLE CONSTRAINTS:\n"
                 f"{style}"
             )
         else:
             instructions = (
                 "You are a helpful voice assistant.\n\n"
+                f"{name_hint}"
+                f"{kb_hint}"
                 "ADDITIONAL STYLE CONSTRAINTS:\n"
                 f"{style}"
             )
@@ -876,6 +905,7 @@ async def _entrypoint_impl(ctx: JobContext):
             welcome=welcome,
             call_id=(call_id_from_internal or _extract_call_id_from_room(ctx)),
             kb_folder_ids=kb_folder_ids,
+            speaker_name=agent_speaker,
         ),
         room=ctx.room,
         room_options=room_io.RoomOptions(
