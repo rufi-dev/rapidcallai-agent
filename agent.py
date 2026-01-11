@@ -429,7 +429,16 @@ def prewarm(proc: JobProcess):
             # Defaults based on LiveKit ElevenLabs plugin docs.
             voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL").strip()
             model = os.environ.get("ELEVENLABS_MODEL", "eleven_flash_v2_5").strip()
-            proc.userdata["tts"] = elevenlabs.TTS(voice_id=voice_id, model=model)
+            # ElevenLabs plugin expects api_key via arg or ELEVEN_API_KEY env var, but many setups
+            # already have ELEVENLABS_API_KEY configured. Support both to avoid crash-loops.
+            api_key = (
+                os.environ.get("ELEVEN_API_KEY", "").strip()
+                or os.environ.get("ELEVENLABS_API_KEY", "").strip()
+            )
+            if api_key:
+                proc.userdata["tts"] = elevenlabs.TTS(voice_id=voice_id, model=model, api_key=api_key)
+            else:
+                proc.userdata["tts"] = elevenlabs.TTS(voice_id=voice_id, model=model)
             proc.userdata["tts_model_name"] = f"elevenlabs/{model}"
     else:
         proc.userdata["tts"] = cartesia.TTS(
