@@ -884,9 +884,15 @@ async def _entrypoint_impl(ctx: JobContext):
     )
 
 
-@server.rtc_session(agent_name=LIVEKIT_AGENT_NAME)
-async def entrypoint(ctx: JobContext):
-    await _entrypoint_impl(ctx)
+if LIVEKIT_AGENT_NAME:
+    @server.rtc_session(agent_name=LIVEKIT_AGENT_NAME)
+    async def entrypoint(ctx: JobContext):
+        await _entrypoint_impl(ctx)
+else:
+    # When no agent name is provided, rely on LiveKit Cloud dispatch rules / default behavior.
+    @server.rtc_session()
+    async def entrypoint(ctx: JobContext):
+        await _entrypoint_impl(ctx)
 
 
 if __name__ == "__main__":
