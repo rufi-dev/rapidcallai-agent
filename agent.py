@@ -121,6 +121,24 @@ def _extract_llm_model_from_room(ctx: JobContext) -> str | None:
     return m if isinstance(m, str) and m.strip() else None
 
 
+def _extract_knowledge_folder_ids_from_room(ctx: JobContext) -> list[str]:
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    v = data.get("agent", {}).get("knowledgeFolderIds") if isinstance(data, dict) else None
+    if not isinstance(v, list):
+        return []
+    out: list[str] = []
+    for x in v:
+        if isinstance(x, str) and x.strip():
+            out.append(x.strip())
+    return out[:50]
+
+
 def _post_call_metrics(call_id: str, payload: dict) -> None:
     base = os.environ.get("SERVER_BASE_URL", "").strip().rstrip("/")
     if not base:
@@ -240,11 +258,20 @@ async def _wait_for_sip_numbers(ctx: JobContext, *, timeout_s: float = 6.0) -> t
 
 
 class MyAgent(Agent):
-    def __init__(self, *, extra_prompt: str | None = None, welcome: dict | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        extra_prompt: str | None = None,
+        welcome: dict | None = None,
+        call_id: str | None = None,
+        kb_folder_ids: list[str] | None = None,
+    ) -> None:
         style = (
             "You interact with users via voice. Keep responses concise and to the point. "
             "Do not use emojis, asterisks, markdown, or other special characters. "
-            "Speak English unless the user requests otherwise."
+            "Speak English unless the user requests otherwise. "
+            "Speak naturally, with short pauses at commas and longer pauses at periods. "
+            "Do not run words together. Do not read punctuation out loud."
         )
 
         # IMPORTANT: Do not hardcode a name/persona here; the per-agent prompt should control it.
@@ -264,6 +291,8 @@ class MyAgent(Agent):
 
         super().__init__(instructions=instructions)
         self._welcome = welcome or {}
+        self._call_id = call_id
+        self._kb_folder_ids = kb_folder_ids or []
 
     async def on_enter(self):
         mode = str(self._welcome.get("mode") or "user")
@@ -312,6 +341,42 @@ class MyAgent(Agent):
         tz_fmt = f"UTC{tz[:3]}:{tz[3:]}" if tz else "local time"
         return now.strftime(f"%Y-%m-%d %H:%M:%S ({tz_fmt})")
 
+    @function_tool
+    async def kb_search(self, context: RunContext, query: str) -> str:
+        """
+        Search the workspace Knowledge Base within the folders linked to this agent.
+        """
+        q = str(query or "").strip()
+        if not q:
+            return "Missing query."
+        if not self._call_id:
+            return "Knowledge Base search is unavailable (missing call id)."
+        if not self._kb_folder_ids:
+            return "No Knowledge Base folders are connected to this agent."
+
+        resp = await asyncio.to_thread(
+            _post_internal_json,
+            "/api/internal/kb/search",
+            {"callId": self._call_id, "query": q, "folderIds": self._kb_folder_ids, "limit": 5},
+        )
+        if not isinstance(resp, dict):
+            return "Knowledge Base search failed."
+        results = resp.get("results")
+        if not isinstance(results, list) or len(results) == 0:
+            return "No matches found in the connected Knowledge Base."
+
+        lines: list[str] = []
+        for r in results[:5]:
+            if not isinstance(r, dict):
+                continue
+            title = str(r.get("title") or "Document").strip()
+            excerpt = str(r.get("excerpt") or "").strip()
+            if excerpt:
+                lines.append(f"- {title}: {excerpt}")
+            else:
+                lines.append(f"- {title}")
+        return "Matches:\n" + "\n".join(lines)
+
 
 server = AgentServer()
 
@@ -342,15 +407,30 @@ def prewarm(proc: JobProcess):
         proc.userdata["stt_model_name"] = f"deepgram/{os.environ.get('DEEPGRAM_STT_MODEL', 'nova-3')}"
     proc.userdata["llm"] = openai.LLM(model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4.1-mini"))
     # TTS backend:
+    # - elevenlabs: direct ElevenLabs plugin (default; per LiveKit docs uses ELEVEN_API_KEY)
+    # - cartesia: direct Cartesia plugin
     # - livekit: LiveKit Inference Gateway
-    # - cartesia: direct Cartesia plugin (recommended when inference is rate-limited)
-    tts_backend = os.environ.get("TTS_BACKEND", "cartesia").strip().lower()
+    tts_backend = os.environ.get("TTS_BACKEND", "elevenlabs").strip().lower()
     if tts_backend == "livekit":
         proc.userdata["tts"] = inference.TTS(
             model=os.environ.get("LK_TTS_MODEL", "cartesia/sonic-2"),
             voice=os.environ.get("LK_TTS_VOICE", ""),
         )
         proc.userdata["tts_model_name"] = f"livekit/{os.environ.get('LK_TTS_MODEL', 'cartesia/sonic-2')}"
+    elif tts_backend == "elevenlabs":
+        if elevenlabs is None:
+            proc.userdata["tts"] = cartesia.TTS(
+                model=os.environ.get("CARTESIA_TTS_MODEL", "sonic-2"),
+                voice=os.environ.get("CARTESIA_VOICE", "a0e99841-438c-4a64-b679-ae501e7d6091"),
+                text_pacing=True,
+            )
+            proc.userdata["tts_model_name"] = f"cartesia/{os.environ.get('CARTESIA_TTS_MODEL', 'sonic-2')}"
+        else:
+            # Defaults based on LiveKit ElevenLabs plugin docs.
+            voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL").strip()
+            model = os.environ.get("ELEVENLABS_MODEL", "eleven_flash_v2_5").strip()
+            proc.userdata["tts"] = elevenlabs.TTS(voice_id=voice_id, model=model)
+            proc.userdata["tts_model_name"] = f"elevenlabs/{model}"
     else:
         proc.userdata["tts"] = cartesia.TTS(
             model=os.environ.get("CARTESIA_TTS_MODEL", "sonic-2"),
@@ -378,12 +458,14 @@ async def _entrypoint_impl(ctx: JobContext):
     agent_name_from_internal: str | None = None
     voice_from_internal: dict | None = None
     llm_model_from_internal: str | None = None
+    kb_folder_ids_from_internal: list[str] = []
     telephony_trunk_to: str | None = None
 
     prompt_from_room = _extract_prompt_from_room(ctx)
     welcome_from_room = _extract_welcome_from_room(ctx)
     agent_name_from_room = _extract_agent_name_from_room(ctx)
     llm_model_from_room = _extract_llm_model_from_room(ctx)
+    kb_folder_ids_from_room = _extract_knowledge_folder_ids_from_room(ctx)
 
     # Only wait for SIP attrs if we don't already have a prompt in room metadata.
     trunk_to, caller_from = (None, None)
@@ -411,6 +493,12 @@ async def _entrypoint_impl(ctx: JobContext):
                 )
                 voice_from_internal = resp.get("voice") if isinstance(resp.get("voice"), dict) else None
                 llm_model_from_internal = resp.get("llmModel") if isinstance(resp.get("llmModel"), str) else None
+                if isinstance(resp.get("knowledgeFolderIds"), list):
+                    kb_folder_ids_from_internal = [
+                        str(x).strip()
+                        for x in resp.get("knowledgeFolderIds")
+                        if isinstance(x, str) and str(x).strip()
+                    ][:50]
                 max_call_seconds_from_internal = (
                     int(resp.get("maxCallSeconds"))
                     if isinstance(resp.get("maxCallSeconds"), (int, float)) and float(resp.get("maxCallSeconds")) >= 0
@@ -429,6 +517,7 @@ async def _entrypoint_impl(ctx: JobContext):
     welcome = welcome_from_internal or welcome_from_room
     agent_speaker = (agent_name_from_internal or agent_name_from_room or "Agent").strip()
     llm_model_used = (llm_model_from_internal or llm_model_from_room or "").strip() or None
+    kb_folder_ids = kb_folder_ids_from_internal or kb_folder_ids_from_room
 
     # Max call duration (seconds): from room metadata (web) or internal telephony response (phone).
     max_call_seconds = 0
@@ -492,12 +581,13 @@ async def _entrypoint_impl(ctx: JobContext):
                     or os.environ.get("ELEVENLABS_API_KEY", "").strip()
                     or None
                 )
+                chosen_model = model or "eleven_flash_v2_5"
                 if api_key:
-                    tts_model_used = f"elevenlabs/{model or 'eleven_turbo_v2_5'}"
-                    tts_obj = elevenlabs.TTS(voice_id=voice_id, model=model or "eleven_turbo_v2_5", api_key=api_key)
+                    tts_model_used = f"elevenlabs/{chosen_model}"
+                    tts_obj = elevenlabs.TTS(voice_id=voice_id, model=chosen_model, api_key=api_key)
                 else:
-                    tts_model_used = f"elevenlabs/{model or 'eleven_turbo_v2_5'}"
-                    tts_obj = elevenlabs.TTS(voice_id=voice_id, model=model or "eleven_turbo_v2_5")
+                    tts_model_used = f"elevenlabs/{chosen_model}"
+                    tts_obj = elevenlabs.TTS(voice_id=voice_id, model=chosen_model)
     except Exception:
         # Never fail the call because of a voice config issue.
         pass
@@ -772,7 +862,12 @@ async def _entrypoint_impl(ctx: JobContext):
     # Start hangup watcher only for telephony calls.
     asyncio.create_task(watch_sip_hangup(), name="watch_sip_hangup")
     await session.start(
-        agent=MyAgent(extra_prompt=extra_prompt, welcome=welcome),
+        agent=MyAgent(
+            extra_prompt=extra_prompt,
+            welcome=welcome,
+            call_id=(call_id_from_internal or _extract_call_id_from_room(ctx)),
+            kb_folder_ids=kb_folder_ids,
+        ),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             # Smaller frames reduce end-to-end latency for both STT and agent response timing.
