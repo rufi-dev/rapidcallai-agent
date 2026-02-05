@@ -154,7 +154,8 @@ def _post_call_metrics(call_id: str, payload: dict) -> None:
         headers["x-agent-secret"] = secret
     req = urlrequest.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urlrequest.urlopen(req, timeout=5) as resp:
+        timeout_s = float(os.environ.get("AGENT_METRICS_TIMEOUT_S", "5") or "5")
+        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
             _ = resp.read()
     except (HTTPError, URLError) as e:
         logger.warning(f"Failed to post call metrics: {e}")
@@ -180,12 +181,39 @@ def _post_internal_json(path: str, payload: dict) -> dict | None:
         method="POST",
     )
     try:
-        with urlrequest.urlopen(req, timeout=10) as resp:
+        timeout_s = float(os.environ.get("AGENT_INTERNAL_TIMEOUT_S", "10") or "10")
+        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             return json.loads(raw) if raw else {}
     except (HTTPError, URLError) as e:
         logger.warning(f"Internal API call failed {path}: {e}")
         return None
+
+
+async def _post_call_metrics_with_retry(call_id: str, payload: dict, *, max_retries: int = 3) -> None:
+    for attempt in range(max_retries):
+        try:
+            _post_call_metrics(call_id, payload)
+            return
+        except Exception as e:
+            if attempt >= max_retries - 1:
+                logger.error(f"Failed to post call metrics after {max_retries} attempts: {e}")
+                return
+            await asyncio.sleep(2 ** attempt)
+
+
+async def _post_internal_json_with_retry(path: str, payload: dict, *, max_retries: int = 3) -> dict | None:
+    for attempt in range(max_retries):
+        try:
+            resp = await asyncio.to_thread(_post_internal_json, path, payload)
+            if resp is not None:
+                return resp
+        except Exception as e:
+            if attempt >= max_retries - 1:
+                logger.error(f"Internal API call failed after {max_retries} attempts {path}: {e}")
+                return None
+        await asyncio.sleep(2 ** attempt)
+    return None
 
 
 def _extract_sip_numbers(ctx: JobContext) -> tuple[str | None, str | None]:
@@ -372,8 +400,7 @@ class MyAgent(Agent):
         if not self._kb_folder_ids:
             return "No Knowledge Base folders are connected to this agent."
 
-        resp = await asyncio.to_thread(
-            _post_internal_json,
+        resp = await _post_internal_json_with_retry(
             "/api/internal/kb/search",
             {"callId": self._call_id, "query": q, "folderIds": self._kb_folder_ids, "limit": 5},
         )
@@ -501,8 +528,7 @@ async def _entrypoint_impl(ctx: JobContext):
         if trunk_to:
             telephony_trunk_to = str(trunk_to)
             sip_call_sid = _extract_sip_call_sid(ctx)
-            resp = await asyncio.to_thread(
-                _post_internal_json,
+            resp = await _post_internal_json_with_retry(
                 "/api/internal/telephony/inbound/start",
                 {
                     "roomName": ctx.room.name,
@@ -815,27 +841,28 @@ async def _entrypoint_impl(ctx: JobContext):
             payload["models"]["stt"] = stt_model_used
         if tts_model_used:
             payload["models"]["tts"] = tts_model_used
-        await asyncio.to_thread(_post_call_metrics, call_id, payload)
+        await _post_call_metrics_with_retry(call_id, payload)
 
     ctx.add_shutdown_callback(log_usage)
 
     # extra_prompt / welcome / agent_speaker are computed before session init (above).
 
     _finalized = False
+    _finalize_lock = asyncio.Lock()
 
     async def finalize_call():
         nonlocal _finalized
-        if _finalized:
-            return
-        call_id = call_id_from_internal or _extract_call_id_from_room(ctx)
-        if not call_id:
-            return
-        _finalized = True
-        await asyncio.to_thread(
-            _post_internal_json,
-            f"/api/internal/calls/{call_id}/end",
-            {"outcome": "completed", "transcript": transcript_items},
-        )
+        async with _finalize_lock:
+            if _finalized:
+                return
+            call_id = call_id_from_internal or _extract_call_id_from_room(ctx)
+            if not call_id:
+                return
+            _finalized = True
+            await _post_internal_json_with_retry(
+                f"/api/internal/calls/{call_id}/end",
+                {"outcome": "completed", "transcript": transcript_items},
+            )
 
     ctx.add_shutdown_callback(finalize_call)
 
