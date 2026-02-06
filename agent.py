@@ -502,6 +502,12 @@ async def _entrypoint_impl(ctx: JobContext):
 
     # Ensure we are connected and have up-to-date room metadata / participant linkage.
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    
+    # Log participants and their audio tracks for debugging web call issues
+    logger.info(f"Connected to room {ctx.room.name}, participants: {[p.identity for p in ctx.room.remote_participants.values()]}")
+    for participant in ctx.room.remote_participants.values():
+        audio_tracks = [pub for pub in participant.track_publications.values() if pub.kind == "audio"]
+        logger.info(f"Participant {participant.identity} has {len(audio_tracks)} audio track(s)")
 
     # Telephony rooms are created by LiveKit SIP/dispatch rules (not by our API),
     # so they usually DO NOT carry the agent config in room metadata.
@@ -931,6 +937,10 @@ async def _entrypoint_impl(ctx: JobContext):
     default_frame_ms = 50 if is_telephony else 20
     frame_size_ms = int(float(os.environ.get("LK_AUDIO_FRAME_MS", str(default_frame_ms))))
     
+    # Pre-connect audio timeout: longer for web calls to allow browser permission prompts
+    # Telephony calls don't need this delay since SIP audio is already connected
+    preconnect_timeout = _env_float("LK_PRECONNECT_AUDIO_TIMEOUT", 5.0 if not is_telephony else 2.0)
+    
     await session.start(
         agent=MyAgent(
             extra_prompt=extra_prompt,
@@ -944,7 +954,7 @@ async def _entrypoint_impl(ctx: JobContext):
             audio_input=room_io.AudioInputOptions(
                 frame_size_ms=frame_size_ms,
                 pre_connect_audio=True,
-                pre_connect_audio_timeout=_env_float("LK_PRECONNECT_AUDIO_TIMEOUT", 2.0),
+                pre_connect_audio_timeout=preconnect_timeout,
                 noise_cancellation=noise_cancel,
             ),
             # Publish transcriptions to the room for clients to render.
