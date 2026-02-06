@@ -12,7 +12,6 @@ from livekit.agents import (
     Agent,
     AgentServer,
     AgentSession,
-    AutoSubscribe,
     JobContext,
     JobProcess,
     MetricsCollectedEvent,
@@ -500,14 +499,10 @@ server.setup_fnc = prewarm
 async def _entrypoint_impl(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
-    # Ensure we are connected and have up-to-date room metadata / participant linkage.
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-    
-    # Log participants and their audio tracks for debugging web call issues
-    logger.info(f"Connected to room {ctx.room.name}, participants: {[p.identity for p in ctx.room.remote_participants.values()]}")
-    for participant in ctx.room.remote_participants.values():
-        audio_tracks = [pub for pub in participant.track_publications.values() if pub.kind == "audio"]
-        logger.info(f"Participant {participant.identity} has {len(audio_tracks)} audio track(s)")
+    # With @server.rtc_session(), the room is already connected.
+    # Do NOT call ctx.connect() — let session.start() manage audio subscriptions.
+    # Calling ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY) would conflict
+    # with the session's own audio pipeline and prevent web call audio from working.
 
     # Telephony rooms are created by LiveKit SIP/dispatch rules (not by our API),
     # so they usually DO NOT carry the agent config in room metadata.
@@ -651,24 +646,20 @@ async def _entrypoint_impl(ctx: JobContext):
         # Never fail the call because of a voice config issue.
         pass
 
+    # AgentSession configuration matches the official LiveKit basic_agent example.
+    # See: https://github.com/livekit/agents/blob/main/examples/voice_agents/basic_agent.py
     session = AgentSession(
-        # Use provider plugins directly (avoids LiveKit hosted inference quota).
         stt=ctx.proc.userdata.get("stt"),
         llm=llm_obj,
         tts=tts_obj,
         vad=ctx.proc.userdata["vad"],
-        # Reduce audio "cutting" caused by aggressive interruption detection in noisy rooms.
-        # Console mode feels smoother because it doesn't have RTC echo/noise artifacts.
-        allow_interruptions=os.environ.get("LK_ALLOW_INTERRUPTIONS", "true").lower() == "true",
-        min_interruption_duration=_env_float("LK_MIN_INTERRUPTION_DURATION", 0.9),
-        min_interruption_words=int(float(os.environ.get("LK_MIN_INTERRUPTION_WORDS", "2"))),
-        # Use intelligent turn detection model (analyzes speech content) instead of VAD-only.
-        # This is essential for telephony where silence-based detection fails due to line noise.
-        # MultilingualModel supports English + 12 other languages, ~400MB RAM, ~25ms inference.
+        # Turn detection model (analyzes speech content) instead of VAD-only silence detection.
         turn_detection=MultilingualModel(),
+        # Allow the LLM to start generating a response before end-of-turn is committed.
         preemptive_generation=True,
+        # Background noise can trigger false positive interruptions; resume if detected.
         resume_false_interruption=True,
-        false_interruption_timeout=_env_float("LK_FALSE_INTERRUPTION_TIMEOUT", 1.0),
+        false_interruption_timeout=1.0,
     )
 
     @session.on("user_state_changed")
@@ -924,23 +915,16 @@ async def _entrypoint_impl(ctx: JobContext):
     
     # Determine if this is a telephony call (SIP) or web call
     is_telephony = telephony_trunk_to is not None
-    
-    # Apply noise cancellation only for telephony calls (phone lines have more noise).
-    # Web calls typically don't need noise cancellation and BVC can be too aggressive,
-    # filtering out user speech. Console mode works because it has no noise cancellation.
-    noise_cancel = None
-    if is_telephony:
-        noise_cancel = noise_cancellation.BVCTelephony()
-    # For web calls, don't use noise cancellation - let the browser handle it
-    
-    # Frame size: use default 50ms for telephony (better for phone codecs), allow override via env
-    default_frame_ms = 50 if is_telephony else 20
-    frame_size_ms = int(float(os.environ.get("LK_AUDIO_FRAME_MS", str(default_frame_ms))))
-    
-    # Pre-connect audio timeout: longer for web calls to allow browser permission prompts
-    # Telephony calls don't need this delay since SIP audio is already connected
-    preconnect_timeout = _env_float("LK_PRECONNECT_AUDIO_TIMEOUT", 5.0 if not is_telephony else 2.0)
-    
+
+    # Noise cancellation: only for telephony (phone lines have background noise).
+    # For web calls, use None — browser handles echo cancellation natively.
+    # Using BVC on web calls can be too aggressive and filter out user speech entirely.
+    noise_cancel = noise_cancellation.BVCTelephony() if is_telephony else None
+
+    # session.start() follows the official LiveKit pattern:
+    # - room_options with minimal AudioInputOptions (just noise cancellation)
+    # - NO custom frame_size_ms, pre_connect_audio, pre_connect_audio_timeout
+    # - The session manages audio subscriptions and connection internally
     await session.start(
         agent=MyAgent(
             extra_prompt=extra_prompt,
@@ -952,14 +936,8 @@ async def _entrypoint_impl(ctx: JobContext):
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
-                frame_size_ms=frame_size_ms,
-                pre_connect_audio=True,
-                pre_connect_audio_timeout=preconnect_timeout,
                 noise_cancellation=noise_cancel,
             ),
-            # Publish transcriptions to the room for clients to render.
-            # Keep agent output text synced to TTS audio so the UI doesn't "dump" the full response at once.
-            # (User STT interim results are controlled by the STT backend settings, not this flag.)
             text_output=room_io.TextOutputOptions(sync_transcription=True),
         ),
     )
