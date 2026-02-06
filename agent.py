@@ -24,6 +24,8 @@ from livekit.agents import (
 from livekit.agents.llm import function_tool
 from livekit.agents import inference
 from livekit.plugins import cartesia, deepgram, openai, silero
+from livekit.plugins.turn_detector.multilingual import MultilingualModel  # type: ignore
+from livekit.plugins import noise_cancellation
 
 try:
     # Optional: only present if you add livekit-plugins-elevenlabs
@@ -444,10 +446,7 @@ def prewarm(proc: JobProcess):
             model=os.environ.get("DEEPGRAM_STT_MODEL", "nova-3"),
             language=os.environ.get("DEEPGRAM_LANGUAGE", "en-US"),
             interim_results=True,
-            endpointing_ms=int(float(os.environ.get("DEEPGRAM_ENDPOINTING_MS", "25"))),
-            no_delay=True,
             punctuate=True,
-            filler_words=True,
         )
         proc.userdata["stt_model_name"] = f"deepgram/{os.environ.get('DEEPGRAM_STT_MODEL', 'nova-3')}"
     proc.userdata["llm"] = openai.LLM(model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4.1-mini"))
@@ -472,8 +471,9 @@ def prewarm(proc: JobProcess):
             proc.userdata["tts_model_name"] = f"cartesia/{os.environ.get('CARTESIA_TTS_MODEL', 'sonic-2')}"
         else:
             # Defaults based on LiveKit ElevenLabs plugin docs.
+            # Use eleven_turbo_v2_5 for better quality over phone (vs speed-optimized flash)
             voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL").strip()
-            model = os.environ.get("ELEVENLABS_MODEL", "eleven_flash_v2_5").strip()
+            model = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5").strip()
             # ElevenLabs plugin expects api_key via arg or ELEVEN_API_KEY env var, but many setups
             # already have ELEVENLABS_API_KEY configured. Support both to avoid crash-loops.
             api_key = (
@@ -634,7 +634,7 @@ async def _entrypoint_impl(ctx: JobContext):
                     or os.environ.get("ELEVENLABS_API_KEY", "").strip()
                     or None
                 )
-                chosen_model = model or "eleven_flash_v2_5"
+                chosen_model = model or "eleven_turbo_v2_5"
                 if api_key:
                     tts_model_used = f"elevenlabs/{chosen_model}"
                     tts_obj = elevenlabs.TTS(voice_id=voice_id, model=chosen_model, api_key=api_key)
@@ -656,10 +656,10 @@ async def _entrypoint_impl(ctx: JobContext):
         allow_interruptions=os.environ.get("LK_ALLOW_INTERRUPTIONS", "true").lower() == "true",
         min_interruption_duration=_env_float("LK_MIN_INTERRUPTION_DURATION", 0.9),
         min_interruption_words=int(float(os.environ.get("LK_MIN_INTERRUPTION_WORDS", "2"))),
-        # Reduce "wait after you stop talking" time before the agent answers.
-        turn_detection="vad",
-        min_endpointing_delay=_env_float("LK_MIN_ENDPOINTING_DELAY", 0.15),
-        max_endpointing_delay=_env_float("LK_MAX_ENDPOINTING_DELAY", 0.8),
+        # Use intelligent turn detection model (analyzes speech content) instead of VAD-only.
+        # This is essential for telephony where silence-based detection fails due to line noise.
+        # MultilingualModel supports English + 12 other languages, ~400MB RAM, ~25ms inference.
+        turn_detection=MultilingualModel(),
         preemptive_generation=True,
         resume_false_interruption=True,
         false_interruption_timeout=_env_float("LK_FALSE_INTERRUPTION_TIMEOUT", 1.0),
@@ -915,6 +915,21 @@ async def _entrypoint_impl(ctx: JobContext):
 
     # Start hangup watcher only for telephony calls.
     asyncio.create_task(watch_sip_hangup(), name="watch_sip_hangup")
+    
+    # Determine if this is a telephony call (SIP) or web call
+    is_telephony = telephony_trunk_to is not None
+    
+    # Apply appropriate noise cancellation: BVCTelephony for phone calls, BVC for web
+    noise_cancel = None
+    if is_telephony:
+        noise_cancel = noise_cancellation.BVCTelephony()
+    else:
+        noise_cancel = noise_cancellation.BVC()
+    
+    # Frame size: use default 50ms for telephony (better for phone codecs), allow override via env
+    default_frame_ms = 50 if is_telephony else 20
+    frame_size_ms = int(float(os.environ.get("LK_AUDIO_FRAME_MS", str(default_frame_ms))))
+    
     await session.start(
         agent=MyAgent(
             extra_prompt=extra_prompt,
@@ -925,11 +940,11 @@ async def _entrypoint_impl(ctx: JobContext):
         ),
         room=ctx.room,
         room_options=room_io.RoomOptions(
-            # Smaller frames reduce end-to-end latency for both STT and agent response timing.
             audio_input=room_io.AudioInputOptions(
-                frame_size_ms=int(float(os.environ.get("LK_AUDIO_FRAME_MS", "20"))),
+                frame_size_ms=frame_size_ms,
                 pre_connect_audio=True,
                 pre_connect_audio_timeout=_env_float("LK_PRECONNECT_AUDIO_TIMEOUT", 2.0),
+                noise_cancellation=noise_cancel,
             ),
             # Publish transcriptions to the room for clients to render.
             # Keep agent output text synced to TTS audio so the UI doesn't "dump" the full response at once.
