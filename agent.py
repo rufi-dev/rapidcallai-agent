@@ -919,12 +919,13 @@ async def _entrypoint_impl(ctx: JobContext):
     # Determine if this is a telephony call (SIP) or web call
     is_telephony = telephony_trunk_to is not None
     
-    # Apply appropriate noise cancellation: BVCTelephony for phone calls, BVC for web
+    # Apply noise cancellation only for telephony calls (phone lines have more noise).
+    # Web calls typically don't need noise cancellation and BVC can be too aggressive,
+    # filtering out user speech. Console mode works because it has no noise cancellation.
     noise_cancel = None
     if is_telephony:
         noise_cancel = noise_cancellation.BVCTelephony()
-    else:
-        noise_cancel = noise_cancellation.BVC()
+    # For web calls, don't use noise cancellation - let the browser handle it
     
     # Frame size: use default 50ms for telephony (better for phone codecs), allow override via env
     default_frame_ms = 50 if is_telephony else 20
