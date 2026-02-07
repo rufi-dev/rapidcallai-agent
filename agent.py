@@ -688,6 +688,14 @@ async def _entrypoint_impl(ctx: JobContext):
     @ctx.room.on("participant_connected")
     def _dbg_participant_connected(participant):
         logger.info(f"[DEBUG] Participant CONNECTED: identity='{participant.identity}' sid='{participant.sid}'")
+        # If tracks were already published before we connected, subscribe now.
+        try:
+            for pub in participant.track_publications.values():
+                if pub.kind == "audio" and not getattr(pub, "subscribed", False):
+                    pub.set_subscribed(True)
+                    logger.info(f"[DEBUG] Track SUBSCRIBE requested (on connect): participant='{participant.identity}' sid='{pub.sid}'")
+        except Exception as e:
+            logger.warning(f"[DEBUG] Failed to subscribe to participant tracks: participant='{participant.identity}' err={e}")
 
     @ctx.room.on("participant_disconnected")
     def _dbg_participant_disconnected(participant):
@@ -696,6 +704,13 @@ async def _entrypoint_impl(ctx: JobContext):
     @ctx.room.on("track_published")
     def _dbg_track_published(publication, participant):
         logger.info(f"[DEBUG] Track PUBLISHED: participant='{participant.identity}' kind={publication.kind} source={publication.source} sid='{publication.sid}'")
+        # Ensure audio tracks are subscribed even when auto_subscribe=SUBSCRIBE_NONE.
+        try:
+            if publication.kind == "audio" and not getattr(publication, "subscribed", False):
+                publication.set_subscribed(True)
+                logger.info(f"[DEBUG] Track SUBSCRIBE requested: participant='{participant.identity}' sid='{publication.sid}'")
+        except Exception as e:
+            logger.warning(f"[DEBUG] Failed to subscribe to track: participant='{participant.identity}' err={e}")
 
     @ctx.room.on("track_subscribed")
     def _dbg_track_subscribed(track, publication, participant):

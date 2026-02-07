@@ -27,6 +27,7 @@ From `python-agent/` (recommended):
 cd python-agent
 lk agent deploy --secrets-file .env .
 ```
+python agent.py start
 
 Notes:
 - The agent reads the selected “agent prompt” from the LiveKit room metadata (set by the Node server).
