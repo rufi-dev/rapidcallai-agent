@@ -687,7 +687,18 @@ async def _entrypoint_impl(ctx: JobContext):
 
     def _is_audio_publication(pub) -> bool:
         kind = getattr(pub, "kind", None)
-        return kind in ("audio", _rtc.TrackKind.AUDIO, 1)
+        # Support enum, int, and string forms across SDK versions.
+        if kind in ("audio", "AUDIO", "Audio", 1):
+            return True
+        # Enum-like objects may expose a 'name'
+        name = getattr(kind, "name", None)
+        if isinstance(name, str) and name.lower() == "audio":
+            return True
+        # Fallback: stringified enum value
+        try:
+            return str(kind).lower().endswith("audio")
+        except Exception:
+            return False
 
     def _participant_id(p) -> str:
         return getattr(p, "identity", None) or getattr(p, "sid", None) or "unknown"
