@@ -685,17 +685,24 @@ async def _entrypoint_impl(ctx: JobContext):
     # ── DEBUG: Room-level track & participant events ──
     from livekit import rtc as _rtc
 
+    def _is_audio_publication(pub) -> bool:
+        kind = getattr(pub, "kind", None)
+        return kind in ("audio", _rtc.TrackKind.AUDIO, 1)
+
+    def _participant_id(p) -> str:
+        return getattr(p, "identity", None) or getattr(p, "sid", None) or "unknown"
+
     @ctx.room.on("participant_connected")
     def _dbg_participant_connected(participant):
-        logger.info(f"[DEBUG] Participant CONNECTED: identity='{participant.identity}' sid='{participant.sid}'")
+        logger.info(f"[DEBUG] Participant CONNECTED: identity='{_participant_id(participant)}' sid='{getattr(participant, 'sid', '?')}'")
         # If tracks were already published before we connected, subscribe now.
         try:
             for pub in participant.track_publications.values():
-                if pub.kind == "audio" and not getattr(pub, "subscribed", False):
+                if _is_audio_publication(pub) and not getattr(pub, "subscribed", False):
                     pub.set_subscribed(True)
-                    logger.info(f"[DEBUG] Track SUBSCRIBE requested (on connect): participant='{participant.identity}' sid='{pub.sid}'")
+                    logger.info(f"[DEBUG] Track SUBSCRIBE requested (on connect): participant='{_participant_id(participant)}' sid='{getattr(pub, 'sid', '?')}'")
         except Exception as e:
-            logger.warning(f"[DEBUG] Failed to subscribe to participant tracks: participant='{participant.identity}' err={e}")
+            logger.warning(f"[DEBUG] Failed to subscribe to participant tracks: participant='{_participant_id(participant)}' err={e}")
 
     @ctx.room.on("participant_disconnected")
     def _dbg_participant_disconnected(participant):
@@ -703,30 +710,45 @@ async def _entrypoint_impl(ctx: JobContext):
 
     @ctx.room.on("track_published")
     def _dbg_track_published(publication, participant):
-        logger.info(f"[DEBUG] Track PUBLISHED: participant='{participant.identity}' kind={publication.kind} source={publication.source} sid='{publication.sid}'")
+        logger.info(
+            f"[DEBUG] Track PUBLISHED: participant='{_participant_id(participant)}' kind={getattr(publication, 'kind', '?')} "
+            f"source={getattr(publication, 'source', '?')} sid='{getattr(publication, 'sid', '?')}'"
+        )
         # Ensure audio tracks are subscribed even when auto_subscribe=SUBSCRIBE_NONE.
         try:
-            if publication.kind == "audio" and not getattr(publication, "subscribed", False):
+            if _is_audio_publication(publication) and not getattr(publication, "subscribed", False):
                 publication.set_subscribed(True)
-                logger.info(f"[DEBUG] Track SUBSCRIBE requested: participant='{participant.identity}' sid='{publication.sid}'")
+                logger.info(f"[DEBUG] Track SUBSCRIBE requested: participant='{_participant_id(participant)}' sid='{getattr(publication, 'sid', '?')}'")
         except Exception as e:
-            logger.warning(f"[DEBUG] Failed to subscribe to track: participant='{participant.identity}' err={e}")
+            logger.warning(f"[DEBUG] Failed to subscribe to track: participant='{_participant_id(participant)}' err={e}")
 
     @ctx.room.on("track_subscribed")
     def _dbg_track_subscribed(track, publication, participant):
-        logger.info(f"[DEBUG] Track SUBSCRIBED: participant='{participant.identity}' kind={track.kind} source={publication.source} sid='{publication.sid}'")
+        logger.info(
+            f"[DEBUG] Track SUBSCRIBED: participant='{_participant_id(participant)}' kind={getattr(track, 'kind', '?')} "
+            f"source={getattr(publication, 'source', '?')} sid='{getattr(publication, 'sid', '?')}'"
+        )
 
     @ctx.room.on("track_unsubscribed")
     def _dbg_track_unsubscribed(track, publication, participant):
-        logger.info(f"[DEBUG] Track UNSUBSCRIBED: participant='{participant.identity}' kind={track.kind}")
+        logger.info(f"[DEBUG] Track UNSUBSCRIBED: participant='{_participant_id(participant)}' kind={getattr(track, 'kind', '?')}")
 
     @ctx.room.on("track_muted")
-    def _dbg_track_muted(publication, participant):
-        logger.info(f"[DEBUG] Track MUTED: participant='{participant.identity}' kind={publication.kind}")
+    def _dbg_track_muted(*args):
+        # Some SDK versions emit only (publication); others emit (publication, participant)
+        publication = args[0] if len(args) > 0 else None
+        participant = args[1] if len(args) > 1 else None
+        logger.info(
+            f"[DEBUG] Track MUTED: participant='{_participant_id(participant)}' kind={getattr(publication, 'kind', '?')}"
+        )
 
     @ctx.room.on("track_unmuted")
-    def _dbg_track_unmuted(publication, participant):
-        logger.info(f"[DEBUG] Track UNMUTED: participant='{participant.identity}' kind={publication.kind}")
+    def _dbg_track_unmuted(*args):
+        publication = args[0] if len(args) > 0 else None
+        participant = args[1] if len(args) > 1 else None
+        logger.info(
+            f"[DEBUG] Track UNMUTED: participant='{_participant_id(participant)}' kind={getattr(publication, 'kind', '?')}"
+        )
 
     # ── DEBUG: Session event handlers ──
     @session.on("user_state_changed")
