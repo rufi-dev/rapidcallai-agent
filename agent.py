@@ -12,6 +12,7 @@ from livekit.agents import (
     Agent,
     AgentServer,
     AgentSession,
+    AutoSubscribe,
     JobContext,
     JobProcess,
     MetricsCollectedEvent,
@@ -505,10 +506,17 @@ async def _entrypoint_impl(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
     # Connect to the room so we can read metadata and see participants BEFORE session.start().
-    # IMPORTANT: do NOT pass auto_subscribe=AutoSubscribe.AUDIO_ONLY here — that was the
-    # original cause of "agent can't hear web users". Let session.start() manage audio
-    # subscriptions internally. Plain ctx.connect() is what the outbound-caller example uses.
-    await ctx.connect()
+    # Use SUBSCRIBE_NONE so we don't pre-subscribe to any tracks — session.start() must
+    # manage audio subscriptions itself to properly wire the VAD -> STT -> LLM pipeline.
+    #
+    # Why this matters for web calls:
+    #   - SUBSCRIBE_ALL (default) subscribes to the web user's audio BEFORE session.start()
+    #     sets up its audio pipeline, so the audio never reaches VAD/STT.
+    #   - AUDIO_ONLY has the same problem.
+    #   - SUBSCRIBE_NONE connects (metadata available) but defers track subscription to session.
+    #
+    # Phone calls work regardless because the SIP participant joins AFTER session.start().
+    await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_NONE)
 
     # Telephony rooms are created by LiveKit SIP/dispatch rules (not by our API),
     # so they usually DO NOT carry the agent config in room metadata.
@@ -934,9 +942,9 @@ async def _entrypoint_impl(ctx: JobContext):
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
-                # BVC noise cancellation — only for telephony (phone lines).
+                # BVCTelephony noise cancellation — only for telephony (phone lines).
                 # NEVER enable for web calls; it filters out browser microphone audio.
-                noise_cancellation=noise_cancellation.BVC() if is_telephony else None,
+                noise_cancellation=noise_cancellation.BVCTelephony() if is_telephony else None,
             ),
             # Sync agent transcription to the room so the web dashboard can display it.
             text_output=room_io.TextOutputOptions(sync_transcription=True),

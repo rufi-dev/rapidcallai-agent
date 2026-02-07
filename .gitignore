@@ -30,4 +30,3 @@ dist-ssr
 # Local runtime data (do not commit)
 data/*.json
 recordings/
-.tmp
