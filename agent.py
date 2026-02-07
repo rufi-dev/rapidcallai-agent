@@ -723,7 +723,8 @@ async def _entrypoint_impl(ctx: JobContext):
     def _dbg_track_published(publication, participant):
         logger.info(
             f"[DEBUG] Track PUBLISHED: participant='{_participant_id(participant)}' kind={getattr(publication, 'kind', '?')} "
-            f"source={getattr(publication, 'source', '?')} sid='{getattr(publication, 'sid', '?')}'"
+            f"source={getattr(publication, 'source', '?')} sid='{getattr(publication, 'sid', '?')}' "
+            f"muted={getattr(publication, 'muted', '?')} subscribed={getattr(publication, 'subscribed', '?')}"
         )
         # Ensure audio tracks are subscribed even when auto_subscribe=SUBSCRIBE_NONE.
         try:
@@ -737,7 +738,8 @@ async def _entrypoint_impl(ctx: JobContext):
     def _dbg_track_subscribed(track, publication, participant):
         logger.info(
             f"[DEBUG] Track SUBSCRIBED: participant='{_participant_id(participant)}' kind={getattr(track, 'kind', '?')} "
-            f"source={getattr(publication, 'source', '?')} sid='{getattr(publication, 'sid', '?')}'"
+            f"source={getattr(publication, 'source', '?')} sid='{getattr(publication, 'sid', '?')}' "
+            f"pub_muted={getattr(publication, 'muted', '?')} track_muted={getattr(track, 'muted', '?')}"
         )
 
     @ctx.room.on("track_unsubscribed")
