@@ -24,6 +24,10 @@ from livekit.agents.llm import function_tool
 from livekit.agents import inference
 from livekit.plugins import cartesia, deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel  # type: ignore
+
+# Krisp noise cancellation — off by default (matches official LiveKit docs).
+# https://github.com/livekit/agents/blob/main/examples/voice_agents/basic_agent.py
+# Only used for telephony calls; BVC on WebRTC audio can filter out user speech entirely.
 from livekit.plugins import noise_cancellation
 
 try:
@@ -497,12 +501,11 @@ server.setup_fnc = prewarm
 
 
 async def _entrypoint_impl(ctx: JobContext):
+    # each log entry will include these fields
     ctx.log_context_fields = {"room": ctx.room.name}
 
-    # With @server.rtc_session(), the room is already connected.
-    # Do NOT call ctx.connect() — let session.start() manage audio subscriptions.
-    # Calling ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY) would conflict
-    # with the session's own audio pipeline and prevent web call audio from working.
+    # @server.rtc_session() already connected the room — do NOT call ctx.connect().
+    # session.start() manages audio subscriptions internally.
 
     # Telephony rooms are created by LiveKit SIP/dispatch rules (not by our API),
     # so they usually DO NOT carry the agent config in room metadata.
@@ -646,18 +649,15 @@ async def _entrypoint_impl(ctx: JobContext):
         # Never fail the call because of a voice config issue.
         pass
 
-    # AgentSession configuration matches the official LiveKit basic_agent example.
-    # See: https://github.com/livekit/agents/blob/main/examples/voice_agents/basic_agent.py
+    # AgentSession — matches the official LiveKit basic_agent pattern.
+    # https://github.com/livekit/agents/blob/main/examples/voice_agents/basic_agent.py
     session = AgentSession(
         stt=ctx.proc.userdata.get("stt"),
         llm=llm_obj,
         tts=tts_obj,
         vad=ctx.proc.userdata["vad"],
-        # Turn detection model (analyzes speech content) instead of VAD-only silence detection.
         turn_detection=MultilingualModel(),
-        # Allow the LLM to start generating a response before end-of-turn is committed.
         preemptive_generation=True,
-        # Background noise can trigger false positive interruptions; resume if detected.
         resume_false_interruption=True,
         false_interruption_timeout=1.0,
     )
@@ -913,18 +913,13 @@ async def _entrypoint_impl(ctx: JobContext):
     # Start hangup watcher only for telephony calls.
     asyncio.create_task(watch_sip_hangup(), name="watch_sip_hangup")
     
-    # Determine if this is a telephony call (SIP) or web call
+    # session.start() follows the official LiveKit basic_agent pattern:
+    # https://github.com/livekit/agents/blob/main/examples/voice_agents/basic_agent.py
+    #
+    # Noise cancellation: OFF by default (same as official docs).
+    # For telephony only — BVC() on WebRTC/browser audio filters out user speech.
     is_telephony = telephony_trunk_to is not None
 
-    # Noise cancellation: only for telephony (phone lines have background noise).
-    # For web calls, use None — browser handles echo cancellation natively.
-    # Using BVC on web calls can be too aggressive and filter out user speech entirely.
-    noise_cancel = noise_cancellation.BVCTelephony() if is_telephony else None
-
-    # session.start() follows the official LiveKit pattern:
-    # - room_options with minimal AudioInputOptions (just noise cancellation)
-    # - NO custom frame_size_ms, pre_connect_audio, pre_connect_audio_timeout
-    # - The session manages audio subscriptions and connection internally
     await session.start(
         agent=MyAgent(
             extra_prompt=extra_prompt,
@@ -936,8 +931,11 @@ async def _entrypoint_impl(ctx: JobContext):
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
-                noise_cancellation=noise_cancel,
+                # BVC noise cancellation — only for telephony (phone lines).
+                # NEVER enable for web calls; it filters out browser microphone audio.
+                noise_cancellation=noise_cancellation.BVC() if is_telephony else None,
             ),
+            # Sync agent transcription to the room so the web dashboard can display it.
             text_output=room_io.TextOutputOptions(sync_transcription=True),
         ),
     )
