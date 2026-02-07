@@ -518,6 +518,15 @@ async def _entrypoint_impl(ctx: JobContext):
     # Phone calls work regardless because the SIP participant joins AFTER session.start().
     await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_NONE)
 
+    # ── DEBUG: Room connection info ──
+    logger.info(f"[DEBUG] Room connected: name={ctx.room.name} state={getattr(ctx.room, 'connection_state', 'unknown')}")
+    logger.info(f"[DEBUG] Room metadata present: {bool(getattr(ctx.room, 'metadata', None))}")
+    logger.info(f"[DEBUG] Remote participants: {len(ctx.room.remote_participants)} -> {[p.identity for p in ctx.room.remote_participants.values()]}")
+    for p in ctx.room.remote_participants.values():
+        pubs = list(p.track_publications.values())
+        audio_pubs = [t for t in pubs if t.kind == "audio"]
+        logger.info(f"[DEBUG]   Participant '{p.identity}': {len(pubs)} tracks total, {len(audio_pubs)} audio, subscribed={[t.subscribed for t in audio_pubs]}")
+
     # Telephony rooms are created by LiveKit SIP/dispatch rules (not by our API),
     # so they usually DO NOT carry the agent config in room metadata.
     # For web rooms, our API embeds prompt/welcome/voice in room metadata.
@@ -673,17 +682,49 @@ async def _entrypoint_impl(ctx: JobContext):
         false_interruption_timeout=1.0,
     )
 
+    # ── DEBUG: Room-level track & participant events ──
+    from livekit import rtc as _rtc
+
+    @ctx.room.on("participant_connected")
+    def _dbg_participant_connected(participant):
+        logger.info(f"[DEBUG] Participant CONNECTED: identity='{participant.identity}' sid='{participant.sid}'")
+
+    @ctx.room.on("participant_disconnected")
+    def _dbg_participant_disconnected(participant):
+        logger.info(f"[DEBUG] Participant DISCONNECTED: identity='{participant.identity}'")
+
+    @ctx.room.on("track_published")
+    def _dbg_track_published(publication, participant):
+        logger.info(f"[DEBUG] Track PUBLISHED: participant='{participant.identity}' kind={publication.kind} source={publication.source} sid='{publication.sid}'")
+
+    @ctx.room.on("track_subscribed")
+    def _dbg_track_subscribed(track, publication, participant):
+        logger.info(f"[DEBUG] Track SUBSCRIBED: participant='{participant.identity}' kind={track.kind} source={publication.source} sid='{publication.sid}'")
+
+    @ctx.room.on("track_unsubscribed")
+    def _dbg_track_unsubscribed(track, publication, participant):
+        logger.info(f"[DEBUG] Track UNSUBSCRIBED: participant='{participant.identity}' kind={track.kind}")
+
+    @ctx.room.on("track_muted")
+    def _dbg_track_muted(publication, participant):
+        logger.info(f"[DEBUG] Track MUTED: participant='{participant.identity}' kind={publication.kind}")
+
+    @ctx.room.on("track_unmuted")
+    def _dbg_track_unmuted(publication, participant):
+        logger.info(f"[DEBUG] Track UNMUTED: participant='{participant.identity}' kind={publication.kind}")
+
+    # ── DEBUG: Session event handlers ──
     @session.on("user_state_changed")
     def on_user_state_changed(ev):
-        logger.info(f"User state: {ev.old_state} -> {ev.new_state}")
+        logger.info(f"[DEBUG] User state: {ev.old_state} -> {ev.new_state}")
 
     @session.on("agent_state_changed")
     def on_agent_state_changed(ev):
-        logger.info(f"Agent state: {ev.old_state} -> {ev.new_state}")
+        logger.info(f"[DEBUG] Agent state: {ev.old_state} -> {ev.new_state}")
 
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(ev):
-        logger.info(f"User transcript ({'final' if ev.is_final else 'partial'}): {ev.transcript}")
+        logger.info(f"[DEBUG] STT transcript ({'FINAL' if ev.is_final else 'partial'}): '{ev.transcript}'")
 
     transcript_items: list[dict] = []
 
@@ -931,6 +972,14 @@ async def _entrypoint_impl(ctx: JobContext):
     # For telephony only — BVC() on WebRTC/browser audio filters out user speech.
     is_telephony = telephony_trunk_to is not None
 
+    logger.info(f"[DEBUG] About to call session.start() — is_telephony={is_telephony}")
+    logger.info(f"[DEBUG]   STT: {type(ctx.proc.userdata.get('stt')).__name__}")
+    logger.info(f"[DEBUG]   LLM: {type(llm_obj).__name__} model={getattr(llm_obj, '_model', getattr(llm_obj, 'model', '?'))}")
+    logger.info(f"[DEBUG]   TTS: {type(tts_obj).__name__}")
+    logger.info(f"[DEBUG]   VAD: {type(ctx.proc.userdata['vad']).__name__}")
+    logger.info(f"[DEBUG]   noise_cancellation: {'BVCTelephony' if is_telephony else 'None'}")
+    logger.info(f"[DEBUG]   Remote participants at start: {[p.identity for p in ctx.room.remote_participants.values()]}")
+
     await session.start(
         agent=MyAgent(
             extra_prompt=extra_prompt,
@@ -950,6 +999,14 @@ async def _entrypoint_impl(ctx: JobContext):
             text_output=room_io.TextOutputOptions(sync_transcription=True),
         ),
     )
+
+    # ── DEBUG: Post session.start() state ──
+    logger.info(f"[DEBUG] session.start() completed")
+    logger.info(f"[DEBUG]   Remote participants after start: {[p.identity for p in ctx.room.remote_participants.values()]}")
+    for p in ctx.room.remote_participants.values():
+        pubs = list(p.track_publications.values())
+        audio_pubs = [t for t in pubs if t.kind == "audio"]
+        logger.info(f"[DEBUG]   Participant '{p.identity}': {len(audio_pubs)} audio tracks, subscribed={[t.subscribed for t in audio_pubs]}, muted={[t.muted for t in audio_pubs]}")
 
 
 if LIVEKIT_AGENT_NAME:
