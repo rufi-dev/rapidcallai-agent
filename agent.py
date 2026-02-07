@@ -504,8 +504,11 @@ async def _entrypoint_impl(ctx: JobContext):
     # each log entry will include these fields
     ctx.log_context_fields = {"room": ctx.room.name}
 
-    # @server.rtc_session() already connected the room — do NOT call ctx.connect().
-    # session.start() manages audio subscriptions internally.
+    # Connect to the room so we can read metadata and see participants BEFORE session.start().
+    # IMPORTANT: do NOT pass auto_subscribe=AutoSubscribe.AUDIO_ONLY here — that was the
+    # original cause of "agent can't hear web users". Let session.start() manage audio
+    # subscriptions internally. Plain ctx.connect() is what the outbound-caller example uses.
+    await ctx.connect()
 
     # Telephony rooms are created by LiveKit SIP/dispatch rules (not by our API),
     # so they usually DO NOT carry the agent config in room metadata.
