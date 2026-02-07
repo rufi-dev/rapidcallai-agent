@@ -12,7 +12,10 @@ from livekit.agents import (
     Agent,
     AgentServer,
     AgentSession,
+    AudioConfig,
     AutoSubscribe,
+    BackgroundAudioPlayer,
+    BuiltinAudioClip,
     JobContext,
     JobProcess,
     MetricsCollectedEvent,
@@ -143,6 +146,78 @@ def _extract_knowledge_folder_ids_from_room(ctx: JobContext) -> list[str]:
         if isinstance(x, str) and x.strip():
             out.append(x.strip())
     return out[:50]
+
+
+# ── Background audio helpers ──────────────────────────────────────────
+# Mapping of user-facing background audio option keys to BuiltinAudioClip + defaults.
+BACKGROUND_AUDIO_OPTIONS: dict[str, dict] = {
+    "office": {
+        "label": "Office ambience",
+        "ambient": BuiltinAudioClip.OFFICE_AMBIENCE,
+        "ambient_volume": 0.7,
+        "thinking": [BuiltinAudioClip.KEYBOARD_TYPING, BuiltinAudioClip.KEYBOARD_TYPING2],
+        "thinking_volume": 0.7,
+    },
+    "keyboard": {
+        "label": "Keyboard typing",
+        "ambient": BuiltinAudioClip.KEYBOARD_TYPING,
+        "ambient_volume": 0.6,
+        "thinking": [BuiltinAudioClip.KEYBOARD_TYPING2],
+        "thinking_volume": 0.7,
+    },
+    "none": {
+        "label": "No background audio",
+        "ambient": None,
+        "ambient_volume": 0,
+        "thinking": [],
+        "thinking_volume": 0,
+    },
+}
+
+
+def _extract_background_audio_from_room(ctx: JobContext) -> dict | None:
+    """Extract background audio config from room metadata (agent.backgroundAudio)."""
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    ba = data.get("agent", {}).get("backgroundAudio") if isinstance(data, dict) else None
+    return ba if isinstance(ba, dict) else None
+
+
+def _build_background_audio_player(bg_cfg: dict | None) -> BackgroundAudioPlayer | None:
+    """Build a BackgroundAudioPlayer from a config dict like {"preset": "office", "ambientVolume": 0.7}."""
+    if not bg_cfg:
+        return None
+
+    preset_key = str(bg_cfg.get("preset") or "").strip().lower()
+    if not preset_key or preset_key == "none":
+        return None
+
+    preset = BACKGROUND_AUDIO_OPTIONS.get(preset_key)
+    if not preset or preset.get("ambient") is None:
+        return None
+
+    ambient_vol = float(bg_cfg.get("ambientVolume", preset.get("ambient_volume", 0.7)))
+    thinking_vol = float(bg_cfg.get("thinkingVolume", preset.get("thinking_volume", 0.7)))
+
+    # Ambient sound
+    ambient_sound = AudioConfig(preset["ambient"], volume=max(0.0, min(1.0, ambient_vol)))
+
+    # Thinking sounds
+    thinking_clips = preset.get("thinking") or []
+    thinking_sound = [
+        AudioConfig(clip, volume=max(0.0, min(1.0, thinking_vol)))
+        for clip in thinking_clips
+    ] if thinking_clips else None
+
+    return BackgroundAudioPlayer(
+        ambient_sound=ambient_sound,
+        thinking_sound=thinking_sound,
+    )
 
 
 def _post_call_metrics(call_id: str, payload: dict) -> None:
@@ -535,6 +610,7 @@ async def _entrypoint_impl(ctx: JobContext):
     agent_name_from_room = _extract_agent_name_from_room(ctx)
     llm_model_from_room = _extract_llm_model_from_room(ctx)
     kb_folder_ids_from_room = _extract_knowledge_folder_ids_from_room(ctx)
+    bg_audio_from_room = _extract_background_audio_from_room(ctx)
 
     # Only wait for SIP attrs if we don't already have a prompt in room metadata.
     trunk_to, caller_from = (None, None)
@@ -976,6 +1052,22 @@ async def _entrypoint_impl(ctx: JobContext):
             text_output=room_io.TextOutputOptions(sync_transcription=True),
         ),
     )
+
+    # ── Background audio ──────────────────────────────────────────────
+    # Works on both web calls and phone calls. The preset is stored in
+    # the agent config and passed via room metadata (agent.backgroundAudio).yes
+    bg_audio_cfg = bg_audio_from_room
+    if not bg_audio_cfg:
+        # For telephony calls, the internal API may pass it back inside voice_from_internal.
+        if isinstance(voice_from_internal, dict):
+            bg_audio_cfg = voice_from_internal.get("backgroundAudio")
+    bg_player = _build_background_audio_player(bg_audio_cfg)
+    if bg_player:
+        try:
+            await bg_player.start(room=ctx.room, agent_session=session)
+            logger.info(f"Background audio started: preset={bg_audio_cfg.get('preset')}")
+        except Exception as e:
+            logger.warning(f"Failed to start background audio: {e}")
 
 
 if LIVEKIT_AGENT_NAME:
