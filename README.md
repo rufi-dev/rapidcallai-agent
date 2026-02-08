@@ -32,7 +32,7 @@ python agent.py start
 Notes:
 - The agent reads the selected “agent prompt” from the LiveKit room metadata (set by the Node server).
 - For metrics posting to work from LiveKit Cloud, you MUST set:
-  - `SERVER_BASE_URL=https://api.rapidcallai.com` (your public API URL)
+  - `SERVER_BASE_URL=https://api.rapidcall.ai` (your public API URL)
 
 ## Updating the cloud agent (when code changes)
 
@@ -51,6 +51,6 @@ lk agent deploy --secrets-file .env .
 If the agent runs in LiveKit Cloud, it cannot reach `http://localhost:8787`.
 Use a public URL:
 
-- `SERVER_BASE_URL=https://api.rapidcallai.com`
+- `SERVER_BASE_URL=https://api.rapidcall.ai`
 
 
