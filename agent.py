@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import ssl
 from dataclasses import asdict
 from datetime import datetime
 from urllib import request as urlrequest
@@ -236,10 +237,19 @@ def _post_call_metrics(call_id: str, payload: dict) -> None:
     req = urlrequest.Request(url, data=body, headers=headers, method="POST")
     try:
         timeout_s = float(os.environ.get("AGENT_METRICS_TIMEOUT_S", "5") or "5")
-        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
+        with urlrequest.urlopen(req, timeout=timeout_s, context=_ssl_context_for_api()) as resp:
             _ = resp.read()
     except (HTTPError, URLError) as e:
         logger.warning(f"Failed to post call metrics: {e}")
+
+
+def _ssl_context_for_api() -> ssl.SSLContext:
+    """SSL context that works with modern APIs (TLS 1.2+). Avoids TLSV1_ALERT_INTERNAL_ERROR on some setups."""
+    ctx = ssl.create_default_context()
+    # Prefer TLS 1.2+ so reverse proxies (e.g. Caddy) accept the connection
+    if hasattr(ssl, "TLSVersion"):
+        ctx.minimum_version = getattr(ssl.TLSVersion, "TLSv1_2", ssl.TLSVersion.TLSv1_2)
+    return ctx
 
 
 def _post_internal_json(path: str, payload: dict) -> dict | None:
@@ -263,7 +273,7 @@ def _post_internal_json(path: str, payload: dict) -> dict | None:
     )
     try:
         timeout_s = float(os.environ.get("AGENT_INTERNAL_TIMEOUT_S", "10") or "10")
-        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
+        with urlrequest.urlopen(req, timeout=timeout_s, context=_ssl_context_for_api()) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             return json.loads(raw) if raw else {}
     except (HTTPError, URLError) as e:
