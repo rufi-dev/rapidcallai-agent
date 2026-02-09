@@ -2,11 +2,10 @@ import asyncio
 import json
 import logging
 import os
-import ssl
 from dataclasses import asdict
 from datetime import datetime
-from urllib import request as urlrequest
-from urllib.error import URLError, HTTPError
+
+import requests
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -230,29 +229,19 @@ def _post_call_metrics(call_id: str, payload: dict) -> None:
         return
     secret = os.environ.get("AGENT_SHARED_SECRET", "").strip()
     url = f"{base}/api/calls/{call_id}/metrics"
-    body = json.dumps(payload).encode("utf-8")
-    headers = {"content-type": "application/json"}
+    headers = {"Content-Type": "application/json"}
     if secret:
         headers["x-agent-secret"] = secret
-    req = urlrequest.Request(url, data=body, headers=headers, method="POST")
     try:
         timeout_s = float(os.environ.get("AGENT_METRICS_TIMEOUT_S", "5") or "5")
-        with urlrequest.urlopen(req, timeout=timeout_s, context=_ssl_context_for_api()) as resp:
-            _ = resp.read()
-    except (HTTPError, URLError) as e:
+        r = requests.post(url, json=payload, headers=headers, timeout=timeout_s)
+        r.raise_for_status()
+    except requests.RequestException as e:
         logger.warning(f"Failed to post call metrics: {e}")
 
 
-def _ssl_context_for_api() -> ssl.SSLContext:
-    """SSL context that works with modern APIs (TLS 1.2+). Avoids TLSV1_ALERT_INTERNAL_ERROR on some setups."""
-    ctx = ssl.create_default_context()
-    # Prefer TLS 1.2+ so reverse proxies (e.g. Caddy) accept the connection
-    if hasattr(ssl, "TLSVersion"):
-        ctx.minimum_version = getattr(ssl.TLSVersion, "TLSv1_2", ssl.TLSVersion.TLSv1_2)
-    return ctx
-
-
 def _post_internal_json(path: str, payload: dict) -> dict | None:
+    """POST to internal API using requests (avoids TLSV1_ALERT_INTERNAL_ERROR on Windows)."""
     base = (
         os.environ.get("SERVER_BASE_URL", "").strip().rstrip("/")
         or os.environ.get("PUBLIC_API_BASE_URL", "").strip().rstrip("/")
@@ -264,19 +253,13 @@ def _post_internal_json(path: str, payload: dict) -> dict | None:
         logger.warning("AGENT_SHARED_SECRET not set; cannot call internal API")
         return None
     url = f"{base}{path}"
-    body = json.dumps(payload).encode("utf-8")
-    req = urlrequest.Request(
-        url,
-        data=body,
-        headers={"content-type": "application/json", "x-agent-secret": secret},
-        method="POST",
-    )
+    headers = {"Content-Type": "application/json", "x-agent-secret": secret}
     try:
         timeout_s = float(os.environ.get("AGENT_INTERNAL_TIMEOUT_S", "10") or "10")
-        with urlrequest.urlopen(req, timeout=timeout_s, context=_ssl_context_for_api()) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            return json.loads(raw) if raw else {}
-    except (HTTPError, URLError) as e:
+        r = requests.post(url, json=payload, headers=headers, timeout=timeout_s)
+        r.raise_for_status()
+        return r.json() if r.text else {}
+    except requests.RequestException as e:
         logger.warning(f"Internal API call failed {path}: {e}")
         return None
 
