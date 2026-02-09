@@ -781,6 +781,16 @@ async def _entrypoint_impl(ctx: JobContext):
         except Exception:
             pass
 
+    # Subscribe to audio from participants already in the room (e.g. SIP joined before we registered handlers).
+    # Without this, the agent says the intro but never hears the user — no ongoing conversation.
+    try:
+        for participant in getattr(ctx.room, "remote_participants", {}).values():
+            for pub in getattr(participant, "track_publications", {}).values():
+                if _is_audio_publication(pub) and not getattr(pub, "subscribed", False):
+                    pub.set_subscribed(True)
+    except Exception as e:
+        logger.warning("Could not subscribe to existing participant audio: %s", e)
+
     transcript_items: list[dict] = []
 
     @session.on("user_input_transcribed")

@@ -46,6 +46,22 @@ lk agent deploy --secrets-file .env .
 
 ## Troubleshooting
 
+### Nothing in logs when I call the number
+
+If you call your inbound number and **no new lines** appear in the agent terminal (no "received job request", no "Job received for room ..."):
+
+1. **Only one worker with that name**  
+   If you have **another** process or **cloud-deployed agent** that also registers as `VoiceAgent` on the **same** LiveKit project, LiveKit may dispatch the call to that worker instead of this one. To see jobs in this terminal, stop the other agent, or use a different `LIVEKIT_AGENT_NAME` for local testing and a dispatch rule that targets it.
+
+2. **Agent still connected**  
+   Confirm you see `registered worker` with `agent_name: "VoiceAgent"` in the logs. If the agent disconnected or crashed, restart it and try again.
+
+3. **Same LiveKit project**  
+   This process must use the **same** `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` as the LiveKit project where your SIP trunk and dispatch rule are configured. Otherwise the job never reaches this worker.
+
+4. **Room created?**  
+   In **LiveKit Cloud** → your project → **Rooms** (or Telephony), place a test call and check whether a **room** is created (e.g. `call-+...`). If no room appears, the call is not reaching LiveKit (check Twilio origination). If a room appears but no agent joins, the dispatch rule or agent name may not match.
+
 ### Agent can’t post metrics
 
 If the agent runs in LiveKit Cloud, it cannot reach `http://localhost:8787`.
