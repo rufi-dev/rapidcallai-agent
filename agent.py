@@ -579,6 +579,7 @@ server.setup_fnc = prewarm
 async def _entrypoint_impl(ctx: JobContext):
     # each log entry will include these fields
     ctx.log_context_fields = {"room": ctx.room.name}
+    logger.info("Job received for room %s (inbound/outbound dispatch)", ctx.room.name)
 
     # Connect to the room so we can read metadata and see participants BEFORE session.start().
     # Use SUBSCRIBE_NONE so we don't pre-subscribe to any tracks — session.start() must
