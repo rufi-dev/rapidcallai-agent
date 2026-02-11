@@ -149,7 +149,11 @@ def _extract_knowledge_folder_ids_from_room(ctx: JobContext) -> list[str]:
 
 
 # ── Background audio helpers ──────────────────────────────────────────
-# Mapping of user-facing background audio option keys to BuiltinAudioClip + defaults.
+# Custom audio files (Office1.mp3, Office2.mp3) live in python-agent/audio/.
+_AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio")
+
+# Mapping of user-facing background audio option keys to BuiltinAudioClip or custom file + defaults.
+# For "office1" / "office2", preset uses "ambient_file" (filename in audio/); agent resolves path at runtime.
 BACKGROUND_AUDIO_OPTIONS: dict[str, dict] = {
     "office": {
         "label": "Office ambience",
@@ -163,6 +167,20 @@ BACKGROUND_AUDIO_OPTIONS: dict[str, dict] = {
         "ambient": BuiltinAudioClip.KEYBOARD_TYPING,
         "ambient_volume": 0.6,
         "thinking": [BuiltinAudioClip.KEYBOARD_TYPING2],
+        "thinking_volume": 0.7,
+    },
+    "office1": {
+        "label": "Office 1 (custom)",
+        "ambient_file": "Office1.mp3",
+        "ambient_volume": 0.7,
+        "thinking": [],
+        "thinking_volume": 0.7,
+    },
+    "office2": {
+        "label": "Office 2 (custom)",
+        "ambient_file": "Office2.mp3",
+        "ambient_volume": 0.7,
+        "thinking": [],
         "thinking_volume": 0.7,
     },
     "none": {
@@ -198,16 +216,29 @@ def _build_background_audio_player(bg_cfg: dict | None) -> BackgroundAudioPlayer
         return None
 
     preset = BACKGROUND_AUDIO_OPTIONS.get(preset_key)
-    if not preset or preset.get("ambient") is None:
+    if not preset:
         return None
 
     ambient_vol = float(bg_cfg.get("ambientVolume", preset.get("ambient_volume", 0.7)))
     thinking_vol = float(bg_cfg.get("thinkingVolume", preset.get("thinking_volume", 0.7)))
 
-    # Ambient sound
-    ambient_sound = AudioConfig(preset["ambient"], volume=max(0.0, min(1.0, ambient_vol)))
+    # Ambient: built-in clip or custom file (office1/office2)
+    ambient_sound = None
+    if preset.get("ambient_file"):
+        # Custom MP3 in python-agent/audio/
+        fname = preset["ambient_file"]
+        path = os.path.join(_AUDIO_DIR, fname)
+        if not os.path.isfile(path):
+            logger.warning("Background audio file not found: %s", path)
+            return None
+        ambient_sound = AudioConfig(path, volume=max(0.0, min(1.0, ambient_vol)))
+    elif preset.get("ambient") is not None:
+        ambient_sound = AudioConfig(preset["ambient"], volume=max(0.0, min(1.0, ambient_vol)))
 
-    # Thinking sounds
+    if ambient_sound is None:
+        return None
+
+    # Thinking sounds (built-in only for custom presets we leave thinking empty)
     thinking_clips = preset.get("thinking") or []
     thinking_sound = [
         AudioConfig(clip, volume=max(0.0, min(1.0, thinking_vol)))

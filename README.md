@@ -10,6 +10,8 @@ It is deployed to **LiveKit Cloud** and runs your voice agent logic. The API cre
 
 in LiveKit room metadata. This agent reads that metadata on join.
 
+**Custom background audio:** Place `Office1.mp3` and `Office2.mp3` in `audio/` to use the **Office 1 (custom)** and **Office 2 (custom)** presets in the dashboard. See `audio/README.md`.
+
 ### Local run (console)
 
 ```bash
