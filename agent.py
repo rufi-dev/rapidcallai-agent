@@ -595,6 +595,7 @@ async def _entrypoint_impl(ctx: JobContext):
     welcome_from_internal: dict | None = None
     agent_name_from_internal: str | None = None
     voice_from_internal: dict | None = None
+    background_audio_from_internal: dict | None = None
     llm_model_from_internal: str | None = None
     kb_folder_ids_from_internal: list[str] = []
     telephony_trunk_to: str | None = None
@@ -630,6 +631,7 @@ async def _entrypoint_impl(ctx: JobContext):
                     (resp.get("agent") or {}).get("name") if isinstance(resp.get("agent"), dict) else None
                 )
                 voice_from_internal = resp.get("voice") if isinstance(resp.get("voice"), dict) else None
+                background_audio_from_internal = resp.get("backgroundAudio") if isinstance(resp.get("backgroundAudio"), dict) else None
                 llm_model_from_internal = resp.get("llmModel") if isinstance(resp.get("llmModel"), str) else None
                 if isinstance(resp.get("knowledgeFolderIds"), list):
                     kb_folder_ids_from_internal = [
@@ -1058,20 +1060,33 @@ async def _entrypoint_impl(ctx: JobContext):
     )
 
     # ── Background audio ──────────────────────────────────────────────
-    # Works on both web calls and phone calls. The preset is stored in
-    # the agent config and passed via room metadata (agent.backgroundAudio).yes
-    bg_audio_cfg = bg_audio_from_room
-    if not bg_audio_cfg:
-        # For telephony calls, the internal API may pass it back inside voice_from_internal.
-        if isinstance(voice_from_internal, dict):
-            bg_audio_cfg = voice_from_internal.get("backgroundAudio")
+    # Web: from room metadata (agent.backgroundAudio). Telephony: from internal API (top-level backgroundAudio or voice.backgroundAudio).
+    # See https://docs.livekit.io/agents/multimodality/audio/ and BackgroundAudioPlayer.start(room=..., agent_session=session).
+    bg_audio_cfg = (
+        bg_audio_from_room
+        or background_audio_from_internal
+        or (voice_from_internal.get("backgroundAudio") if isinstance(voice_from_internal, dict) else None)
+    )
     bg_player = _build_background_audio_player(bg_audio_cfg)
+    bg_player_started = False
     if bg_player:
         try:
             await bg_player.start(room=ctx.room, agent_session=session)
-            logger.info(f"Background audio started: preset={bg_audio_cfg.get('preset')}")
+            bg_player_started = True
+            logger.info("Background audio started: preset=%s", bg_audio_cfg.get("preset") if isinstance(bg_audio_cfg, dict) else "?")
         except Exception as e:
-            logger.warning(f"Failed to start background audio: {e}")
+            logger.warning("Failed to start background audio: %s", e)
+    elif bg_audio_cfg and isinstance(bg_audio_cfg, dict) and str(bg_audio_cfg.get("preset") or "").strip().lower() not in ("", "none"):
+        logger.info("Background audio skipped: preset=%s not in (office, keyboard)", bg_audio_cfg.get("preset"))
+
+    async def _close_background_audio():
+        if bg_player and bg_player_started:
+            try:
+                await bg_player.aclose()
+            except Exception as e:
+                logger.warning("Background audio close: %s", e)
+
+    ctx.add_shutdown_callback(_close_background_audio)
 
 
 if LIVEKIT_AGENT_NAME:
