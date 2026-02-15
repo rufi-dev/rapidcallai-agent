@@ -2,13 +2,19 @@
 Minimal LiveKit voice agent. Follows official examples only.
 - basic_agent: https://github.com/livekit/agents/blob/main/examples/voice_agents/basic_agent.py
 - mcp-agent: https://github.com/livekit/agents/blob/main/examples/voice_agents/mcp/mcp-agent.py
+- nvidia_test: https://github.com/livekit/agents/blob/main/examples/voice_agents/nvidia_test.py
+- flush_llm_node: https://github.com/livekit/agents/blob/main/examples/voice_agents/flush_llm_node.py
 - Session/docs: https://docs.livekit.io/agents/build/sessions/
 - Voice: no numbered/bullet lists (flowing sentences only) so TTS matches console on web.
 - End call: agent has end_call tool; use when user says goodbye or wants to hang up.
+- Inactivity: optional "are you there?" prompt and max call duration from room metadata.
 """
+import asyncio
 import json
 import logging
 import os
+import time
+from collections.abc import AsyncIterable
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -16,12 +22,15 @@ from livekit.agents import (
     AgentServer,
     AgentSession,
     AutoSubscribe,
+    FlushSentinel,
     JobContext,
     JobProcess,
     MetricsCollectedEvent,
+    ModelSettings,
     RunContext,
     cli,
     inference,
+    llm,
     metrics,
     room_io,
 )
@@ -35,6 +44,11 @@ try:
     from livekit.plugins import elevenlabs
 except Exception:
     elevenlabs = None
+
+try:
+    from livekit.plugins import nvidia
+except Exception:
+    nvidia = None
 
 load_dotenv()
 logger = logging.getLogger("agent")
@@ -108,6 +122,48 @@ def _enabled_tools_from_room(ctx: JobContext) -> list[str]:
         return ["end_call"]
 
 
+def _call_options_from_room(ctx: JobContext) -> dict:
+    """Read call options from agent.callOptions or agent.maxCallSeconds (server already sends maxCallSeconds)."""
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        agent = data.get("agent") or {}
+        opts = agent.get("callOptions") or {}
+        max_sec = _positive_float(agent.get("maxCallSeconds"), 0)
+        max_min_from_sec = max_sec / 60.0 if max_sec > 0 else 0
+        max_min = _positive_float(opts.get("maxCallDurationMinutes"), max_min_from_sec)
+        if max_min <= 0 and max_min_from_sec > 0:
+            max_min = max_min_from_sec
+        return {
+            "max_call_duration_minutes": max_min,
+            "inactivity_check_seconds": _positive_float(opts.get("inactivityCheckSeconds"), 0),
+            "inactivity_prompt": str(opts.get("inactivityPrompt") or "Are you still there?").strip() or "Are you still there?",
+            "end_call_after_inactivity_seconds": _positive_float(opts.get("endCallAfterInactivitySeconds"), 0),
+        }
+    except Exception:
+        return {}
+
+
+def _positive_float(val, default: float) -> float:
+    try:
+        v = float(val) if val is not None else default
+        return max(0.0, v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_stt(ctx: JobContext):
+    """STT from room metadata: use NVIDIA when voice.provider is nvidia, else Deepgram."""
+    voice_cfg = _voice_from_room(ctx)
+    provider = str(voice_cfg.get("provider") or "").strip().lower()
+    if provider == "nvidia" and nvidia:
+        lang = str(voice_cfg.get("languageCode") or "en-US").strip() or "en-US"
+        return nvidia.STT(language_code=lang)
+    return inference.STT("deepgram/nova-3", language="multi")
+
+
 def _build_tts(ctx: JobContext):
     """TTS from room metadata voice (provider, model, voiceId) so dashboard voice selection is used."""
     voice_cfg = _voice_from_room(ctx)
@@ -115,6 +171,11 @@ def _build_tts(ctx: JobContext):
     model = str(voice_cfg.get("model") or "").strip() or "sonic-3"
     voice_id = str(voice_cfg.get("voiceId") or "").strip() or "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
 
+    if provider == "nvidia" and nvidia:
+        # NVIDIA TTS: voice is e.g. Magpie-Multilingual.EN-US.Leo or from dashboard
+        nvidia_voice = voice_id if voice_id and not voice_id.startswith("96") else "Magpie-Multilingual.EN-US.Leo"
+        lang = str(voice_cfg.get("languageCode") or "en-US").strip() or "en-US"
+        return nvidia.TTS(voice=nvidia_voice, language_code=lang)
     if provider == "elevenlabs" and elevenlabs and voice_id:
         return elevenlabs.TTS(
             voice_id=voice_id,
@@ -124,7 +185,9 @@ def _build_tts(ctx: JobContext):
 
 
 class VoiceAgent(Agent):
-    """Single agent with instructions and tools from dashboard (end_call, lookup_weather)."""
+    """Single agent with instructions and tools from dashboard (end_call, lookup_weather).
+    Uses flush llm_node: when a tool is invoked without prior text, says a quick filler and flushes to TTS.
+    """
 
     def __init__(
         self,
@@ -141,6 +204,34 @@ class VoiceAgent(Agent):
             return
         # Give client time to calibrate AEC (basic_agent.py)
         self.session.generate_reply(allow_interruptions=False)
+
+    async def llm_node(
+        self,
+        chat_ctx: llm.ChatContext,
+        tools: list[llm.FunctionTool],
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[llm.ChatChunk | FlushSentinel]:
+        """Override to flush a quick filler to TTS when a tool is called (e.g. lookup_weather)."""
+        called_tools: list[llm.FunctionToolCall] = []
+        has_text_message = False
+        async for chunk in Agent.default.llm_node(
+            agent=self,
+            chat_ctx=chat_ctx,
+            tools=tools,
+            model_settings=model_settings,
+        ):
+            if isinstance(chunk, llm.ChatChunk) and chunk.delta:
+                if chunk.delta.content:
+                    has_text_message = True
+                if chunk.delta.tool_calls:
+                    called_tools.extend(chunk.delta.tool_calls)
+            yield chunk
+        tool_names = [t.name for t in called_tools]
+        if not has_text_message and tool_names:
+            filler = "One moment while I look that up. "
+            logger.info("Flush filler for tool(s): %s", tool_names)
+            yield filler
+            yield FlushSentinel()
 
     @function_tool
     async def lookup_weather(
@@ -188,9 +279,10 @@ async def _run_session(ctx: JobContext):
     tool_list = [EndCallTool()] if "end_call" in enabled else []
     # lookup_weather is on VoiceAgent as @function_tool; add agent only if that tool is enabled
     tts_obj = _build_tts(ctx)
+    stt_obj = _build_stt(ctx)
 
     session = AgentSession(
-        stt=inference.STT("deepgram/nova-3", language="multi"),
+        stt=stt_obj,
         llm=inference.LLM("openai/gpt-4.1-mini"),
         tts=tts_obj,
         vad=ctx.proc.userdata["vad"],
@@ -198,6 +290,7 @@ async def _run_session(ctx: JobContext):
         preemptive_generation=True,
         resume_false_interruption=True,
         false_interruption_timeout=1.0,
+        min_interruption_duration=0.2,
         mcp_servers=_mcp_servers(),
     )
 
@@ -223,6 +316,59 @@ async def _run_session(ctx: JobContext):
         logger.info("Usage: %s", usage_collector.get_summary())
 
     ctx.add_shutdown_callback(log_usage)
+
+    # Inactivity and max call duration (from room metadata agent.callOptions)
+    call_opts = _call_options_from_room(ctx)
+    last_activity = {"t": time.monotonic()}
+    session_start = time.monotonic()
+    inactivity_prompted_at: float | None = None
+
+    def _on_user_input(ev):
+        if getattr(ev, "is_final", True):
+            last_activity["t"] = time.monotonic()
+
+    try:
+        session.on("user_input_transcribed", _on_user_input)
+    except Exception:
+        pass
+
+    async def _inactivity_and_max_duration_loop():
+        nonlocal inactivity_prompted_at
+        check_interval = 10.0
+        max_dur = call_opts.get("max_call_duration_minutes") or 0
+        inact_check = call_opts.get("inactivity_check_seconds") or 0
+        inact_prompt = call_opts.get("inactivity_prompt") or "Are you still there?"
+        end_after_inact = call_opts.get("end_call_after_inactivity_seconds") or 0
+        if max_dur <= 0 and inact_check <= 0:
+            return
+        while True:
+            await asyncio.sleep(check_interval)
+            now = time.monotonic()
+            elapsed_min = (now - session_start) / 60.0
+            if max_dur > 0 and elapsed_min >= max_dur:
+                logger.info("Max call duration reached (%.1f min), ending call", max_dur)
+                await ctx.shutdown(reason="max_call_duration")
+                return
+            since_activity = now - last_activity["t"]
+            if inact_check > 0 and since_activity >= inact_check:
+                if inactivity_prompted_at is None:
+                    logger.info("User inactive %.0fs, saying: %s", since_activity, inact_prompt[:50])
+                    inactivity_prompted_at = now
+                    try:
+                        session.say(inact_prompt)
+                    except Exception as e:
+                        logger.warning("generate_reply for inactivity failed: %s", e)
+                elif end_after_inact > 0 and (now - inactivity_prompted_at) >= end_after_inact:
+                    logger.info("User still inactive after prompt, ending call")
+                    await ctx.shutdown(reason="inactivity")
+                    return
+            else:
+                inactivity_prompted_at = None
+
+    loop_task: asyncio.Task | None = None
+    if (call_opts.get("max_call_duration_minutes") or 0) > 0 or (call_opts.get("inactivity_check_seconds") or 0) > 0:
+        loop_task = asyncio.create_task(_inactivity_and_max_duration_loop())
+        ctx.add_shutdown_callback(lambda: loop_task.cancel() if loop_task else None)
 
     await session.start(
         agent=VoiceAgent(instructions=instructions, speak_first=speak_first, tools=tool_list),
