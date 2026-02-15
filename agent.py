@@ -368,8 +368,9 @@ async def _run_session(ctx: JobContext):
         vad=ctx.proc.userdata["vad"],
         turn_detection=MultilingualModel(),
         preemptive_generation=True,
-        resume_false_interruption=True,
-        false_interruption_timeout=1.0,
+        # When user interrupts and then speaks, respond to the NEW message instead of resuming the cut-off reply.
+        resume_false_interruption=False,
+        false_interruption_timeout=0.3,
         min_interruption_duration=0.2,
         mcp_servers=_mcp_servers(),
     )
@@ -411,24 +412,20 @@ async def _run_session(ctx: JobContext):
 
     ctx.add_shutdown_callback(log_usage)
 
-    async def _post_latency_metrics():
-        call_id = _call_id_from_room(ctx)
-        base_url = (os.environ.get("SERVER_BASE_URL") or "").strip().rstrip("/")
-        secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
-        if not call_id or not base_url or not secret:
-            return
+    _latency_posted = {"done": False}
+
+    def _build_latency_payload():
         n_eou = len(latency_eou_delays)
         n_llm = len(latency_llm_ttfts)
         n_tts = len(latency_tts_ttfbs)
         if n_eou == 0 and n_llm == 0 and n_tts == 0:
-            return
+            return None
         eou_avg = sum(latency_eou_delays) / n_eou if n_eou else 0.0
         eou_trans_avg = sum(latency_eou_transcription_delays) / n_eou if n_eou else 0.0
         llm_ttft_avg = sum(latency_llm_ttfts) / n_llm if n_llm else 0.0
         tts_ttfb_avg = sum(latency_tts_ttfbs) / n_tts if n_tts else 0.0
-        # Total conversation latency (seconds -> ms): eou + llm ttft + tts ttfb
         agent_turn_ms = (eou_avg + llm_ttft_avg + tts_ttfb_avg) * 1000.0
-        payload = {
+        return {
             "latency": {
                 "eou_end_ms_avg": round(eou_avg * 1000.0),
                 "eou_transcription_ms_avg": round(eou_trans_avg * 1000.0),
@@ -436,6 +433,26 @@ async def _run_session(ctx: JobContext):
                 "agent_turn_latency_ms_avg": round(agent_turn_ms),
             }
         }
+
+    async def _post_latency_metrics():
+        if _latency_posted["done"]:
+            return
+        call_id = _call_id_from_room(ctx)
+        base_url = (os.environ.get("SERVER_BASE_URL") or "").strip().rstrip("/")
+        secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
+        if not call_id:
+            logger.debug("Latency metrics: no call id in room metadata (metrics not posted)")
+            return
+        if not base_url:
+            logger.warning("Latency metrics: SERVER_BASE_URL not set (metrics not posted)")
+            return
+        if not secret:
+            logger.warning("Latency metrics: AGENT_SHARED_SECRET not set (metrics not posted)")
+            return
+        payload = _build_latency_payload()
+        if not payload:
+            return
+        _latency_posted["done"] = True
         url = f"{base_url}/api/calls/{call_id}/metrics"
         try:
             import requests
@@ -456,6 +473,43 @@ async def _run_session(ctx: JobContext):
             logger.warning("Failed to post latency metrics: %s", e)
 
     ctx.add_shutdown_callback(_post_latency_metrics)
+
+    async def _periodic_latency_post():
+        """Post latency every 20s so we have data even if shutdown doesn't run."""
+        while True:
+            await asyncio.sleep(20.0)
+            if _latency_posted["done"]:
+                continue
+            payload = _build_latency_payload()
+            if not payload:
+                continue
+            call_id = _call_id_from_room(ctx)
+            base_url = (os.environ.get("SERVER_BASE_URL") or "").strip().rstrip("/")
+            secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
+            if not call_id or not base_url or not secret:
+                continue
+            _latency_posted["done"] = True
+            url = f"{base_url}/api/calls/{call_id}/metrics"
+            try:
+                import requests
+                resp = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: requests.post(
+                        url,
+                        json=payload,
+                        headers={"x-agent-secret": secret, "content-type": "application/json"},
+                        timeout=10,
+                    ),
+                )
+                if resp.status_code >= 400:
+                    logger.warning("POST %s (periodic) failed: %s", url, resp.status_code)
+                else:
+                    logger.info("Posted latency metrics (periodic) for call %s", call_id)
+            except Exception as e:
+                logger.warning("Periodic latency post failed: %s", e)
+
+    _latency_task = asyncio.create_task(_periodic_latency_post())
+    ctx.add_shutdown_callback(lambda: _latency_task.cancel() if _latency_task else None)
 
     # Inactivity and max call duration (from room metadata agent.callOptions)
     call_opts = _call_options_from_room(ctx)
