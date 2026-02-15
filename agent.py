@@ -410,7 +410,42 @@ async def _run_session(ctx: JobContext):
     instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}{backchannel_rule}{voicemail_rule}"
     speak_first = _welcome_mode_from_room(ctx) != "user"
     enabled = _enabled_tools_from_room(ctx)
-    tool_list = [EndCallTool()] if "end_call" in enabled else []
+
+    async def _post_end_call_to_server() -> None:
+        """POST to RapidCall API so it can hang up the SIP leg and send call_ended/call_analyzed webhooks."""
+        call_id = _call_id_from_room(ctx)
+        base_url = (os.environ.get("SERVER_BASE_URL") or "").strip().rstrip("/")
+        secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
+        if not call_id or not base_url or not secret:
+            logger.debug("End call: not posting to server (missing call_id, SERVER_BASE_URL, or AGENT_SHARED_SECRET)")
+            return
+        url = f"{base_url}/api/internal/calls/{call_id}/end"
+        try:
+            import requests
+            body: dict = {"outcome": "agent_hangup"}
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.post(
+                    url,
+                    json=body,
+                    headers={"x-agent-secret": secret, "content-type": "application/json"},
+                    timeout=10,
+                ),
+            )
+            if resp.status_code >= 400:
+                logger.warning("POST %s failed: %s %s", url, resp.status_code, resp.text[:200])
+            else:
+                logger.info("Posted end call to server for call %s (SIP hangup + webhooks)", call_id)
+        except Exception as e:
+            logger.warning("Failed to post end call to server: %s", e)
+
+    async def _on_end_call_tool_called(_ev) -> None:
+        await _post_end_call_to_server()
+
+    end_call_tool = (
+        EndCallTool(on_tool_called=_on_end_call_tool_called) if "end_call" in enabled else None
+    )
+    tool_list = [end_call_tool] if end_call_tool else []
     # lookup_weather is on VoiceAgent as @function_tool; add agent only if that tool is enabled
     tts_obj = _build_tts(ctx)
     stt_obj = _build_stt(ctx)
