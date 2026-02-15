@@ -65,8 +65,12 @@ LIVEKIT_AGENT_NAME = os.environ.get("LIVEKIT_AGENT_NAME", "").strip()
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "").strip()
 
 def _mcp_servers():
-    """MCP servers if URL set and livekit-agents[mcp] installed (see mcp-agent.py example)."""
+    """MCP servers if URL set and livekit-agents[mcp] installed (see mcp-agent.py example). Skip localhost unless you run an MCP server."""
     if not MCP_SERVER_URL:
+        return []
+    url_lower = MCP_SERVER_URL.strip().lower()
+    if "localhost" in url_lower or "127.0.0.1" in url_lower:
+        logger.debug("MCP_SERVER_URL is localhost; skipping MCP to avoid connection errors when no server is running")
         return []
     try:
         from livekit.agents import mcp
