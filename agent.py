@@ -122,6 +122,19 @@ def _enabled_tools_from_room(ctx: JobContext) -> list[str]:
         return ["end_call"]
 
 
+def _backchannel_enabled_from_room(ctx: JobContext) -> bool:
+    """Read agent.backchannelEnabled from room metadata (dashboard Speech settings)."""
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return False
+    try:
+        data = json.loads(raw)
+        agent = data.get("agent") or {}
+        return bool(agent.get("backchannelEnabled"))
+    except Exception:
+        return False
+
+
 def _call_options_from_room(ctx: JobContext) -> dict:
     """Read call options from agent.callOptions or agent.maxCallSeconds (server already sends maxCallSeconds)."""
     raw = getattr(ctx.room, "metadata", None)
@@ -273,7 +286,13 @@ async def _run_session(ctx: JobContext):
         "END CALL: You have an end_call tool. When the user says goodbye, wants to hang up, or "
         "is done with the conversation, call end_call. Say a brief goodbye first, then call the tool."
     )
-    instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}"
+    backchannel_rule = ""
+    if _backchannel_enabled_from_room(ctx):
+        backchannel_rule = (
+            "\n\nBACKCHANNELING: While the user is speaking, you may use brief verbal affirmations "
+            "(e.g. \"yeah\", \"uh-huh\", \"mm-hmm\", \"right\") to show you are listening. Keep them short and natural."
+        )
+    instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}{backchannel_rule}"
     speak_first = _welcome_mode_from_room(ctx) != "user"
     enabled = _enabled_tools_from_room(ctx)
     tool_list = [EndCallTool()] if "end_call" in enabled else []
