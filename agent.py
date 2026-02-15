@@ -238,17 +238,21 @@ def _build_tts(ctx: JobContext):
             voice_id=voice_id,
             model=model or "eleven_turbo_v2_5",
         )
-    # text_pacing=False for smoother playback (avoids micro-chunk boundaries and stutter).
-    # Prefer 48kHz to match WebRTC and avoid extra resampling; fallback to plugin default if unsupported.
+    # text_pacing=False for smoother playback. speed=1.15 for more natural pace (avoids slow, over-stressed intonation).
+    # Prefer 48kHz to match WebRTC; fallback if plugin version doesn't support speed/sample_rate.
     try:
         return cartesia.TTS(
             model=model or "sonic-3",
             voice=voice_id,
             text_pacing=False,
             sample_rate=48000,
+            speed=1.15,
         )
     except TypeError:
-        return cartesia.TTS(model=model or "sonic-3", voice=voice_id, text_pacing=False)
+        try:
+            return cartesia.TTS(model=model or "sonic-3", voice=voice_id, text_pacing=False, speed=1.15)
+        except TypeError:
+            return cartesia.TTS(model=model or "sonic-3", voice=voice_id, text_pacing=False)
 
 
 class VoiceAgent(Agent):
@@ -393,6 +397,7 @@ async def _run_session(ctx: JobContext):
     latency_eou_transcription_delays: list[float] = []
     latency_llm_ttfts: list[float] = []
     latency_tts_ttfbs: list[float] = []
+    _latency_posted: dict = {"done": False}
 
     @session.on("metrics_collected")
     def _on_metrics(ev: MetricsCollectedEvent):
@@ -406,13 +411,22 @@ async def _run_session(ctx: JobContext):
             latency_llm_ttfts.append(m.ttft)
         elif isinstance(m, TTSMetrics):
             latency_tts_ttfbs.append(m.ttfb)
+        # Post latency as soon as we have one full turn so the UI gets it quickly.
+        if (
+            not _latency_posted["done"]
+            and len(latency_eou_delays) >= 1
+            and len(latency_llm_ttfts) >= 1
+            and len(latency_tts_ttfbs) >= 1
+        ):
+            try:
+                asyncio.get_running_loop().create_task(_post_latency_metrics())
+            except RuntimeError:
+                pass
 
     async def log_usage():
         logger.info("Usage: %s", usage_collector.get_summary())
 
     ctx.add_shutdown_callback(log_usage)
-
-    _latency_posted = {"done": False}
 
     def _build_latency_payload():
         n_eou = len(latency_eou_delays)
