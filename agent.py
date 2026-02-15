@@ -3,6 +3,8 @@ Minimal LiveKit voice agent. Follows official examples only.
 - basic_agent: https://github.com/livekit/agents/blob/main/examples/voice_agents/basic_agent.py
 - mcp-agent: https://github.com/livekit/agents/blob/main/examples/voice_agents/mcp/mcp-agent.py
 - Session/docs: https://docs.livekit.io/agents/build/sessions/
+- Voice: no numbered/bullet lists (flowing sentences only) so TTS matches console on web.
+- End call: agent has end_call tool; use when user says goodbye or wants to hang up.
 """
 import json
 import logging
@@ -115,10 +117,21 @@ async def _run_session(ctx: JobContext):
     # Connect with SUBSCRIBE_NONE so session manages audio (avoids agent not hearing user on web).
     await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_NONE)
 
-    instructions = _instructions_from_room(ctx) or (
+    base = _instructions_from_room(ctx) or (
         "You are a helpful voice assistant. Keep responses concise. "
         "Do not use emojis or markdown. Speak naturally for TTS."
     )
+    # Voice-only: no numbered or bullet lists (causes robotic pauses on web). Use flowing sentences.
+    voice_rules = (
+        "VOICE OUTPUT: Reply in short, flowing sentences. Do not use numbered lists (1. 2. 3.) "
+        "or bullet points; they cause long pauses when spoken. Say the same content in plain prose."
+    )
+    # End call: document the tool so the LLM (and you in the dashboard prompt) know when to use it.
+    end_call_rule = (
+        "END CALL: You have an end_call tool. When the user says goodbye, wants to hang up, or "
+        "is done with the conversation, call end_call. Say a brief goodbye first, then call the tool."
+    )
+    instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}"
     speak_first = _welcome_mode_from_room(ctx) != "user"
 
     # Session options from basic_agent + docs (preemptive_generation, resume_false_interruption).

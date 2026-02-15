@@ -10,7 +10,9 @@ Minimal voice agent aligned with official LiveKit examples only.
 
 - Reads **prompt** from room metadata (`agent.prompt`). Your API sets this when creating the room.
 - Uses **inference** models: Deepgram nova-3 (STT), OpenAI gpt-4.1-mini (LLM), Cartesia sonic-3 (TTS).
-- **End call:** Exposes LiveKit’s `EndCallTool` so the LLM can end the call when the user says goodbye.
+- **End call:** The agent has an `end_call` tool. To trigger it from your **dashboard prompt**, add:  
+  *"When the user says goodbye or wants to end the call, say a brief goodbye and then use the end_call tool."*  
+  The agent’s system instructions already tell the LLM about this; you can repeat it in the prompt for emphasis.
 - **MCP (optional):** Set `MCP_SERVER_URL=http://localhost:8000/sse` and run `mcp_server.py` to add tools (e.g. `get_weather`). Install with `pip install 'livekit-agents[mcp]'`.
 
 ## Local run
