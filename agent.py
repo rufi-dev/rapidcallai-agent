@@ -224,7 +224,17 @@ def _build_tts(ctx: JobContext):
             voice_id=voice_id,
             model=model or "eleven_turbo_v2_5",
         )
-    return cartesia.TTS(model=model or "sonic-3", voice=voice_id, text_pacing=True)
+    # text_pacing=False for smoother playback (avoids micro-chunk boundaries and stutter).
+    # Prefer 48kHz to match WebRTC and avoid extra resampling; fallback to plugin default if unsupported.
+    try:
+        return cartesia.TTS(
+            model=model or "sonic-3",
+            voice=voice_id,
+            text_pacing=False,
+            sample_rate=48000,
+        )
+    except TypeError:
+        return cartesia.TTS(model=model or "sonic-3", voice=voice_id, text_pacing=False)
 
 
 class VoiceAgent(Agent):
@@ -307,9 +317,12 @@ async def _run_session(ctx: JobContext):
         "Do not use emojis or markdown. Speak naturally for TTS."
     )
     # Voice-only: no numbered or bullet lists (causes robotic pauses on web). Use flowing sentences.
+    # Continuous speech reduces chunk-boundary artifacts and improves streaming quality.
     voice_rules = (
         "VOICE OUTPUT: Reply in short, flowing sentences. Do not use numbered lists (1. 2. 3.) "
-        "or bullet points; they cause long pauses when spoken. Say the same content in plain prose."
+        "or bullet points; they cause long pauses when spoken. Say the same content in plain prose. "
+        "Generate speech in full continuous sentences without micro-pauses between phrases; "
+        "ensure stable prosody and consistent volume across the full utterance."
     )
     # End call: document the tool so the LLM (and you in the dashboard prompt) know when to use it.
     end_call_rule = (
@@ -484,7 +497,7 @@ async def _run_session(ctx: JobContext):
                 if ambient is not None:
                     background_audio = BackgroundAudioPlayer(ambient_sound=ambient)
                     async def _start_bg_audio():
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(2.0)
                         try:
                             await background_audio.start(room=ctx.room, agent_session=session)
                         except Exception as e:
@@ -498,7 +511,8 @@ async def _run_session(ctx: JobContext):
         agent=VoiceAgent(instructions=instructions, speak_first=speak_first, tools=tool_list),
         room=ctx.room,
         room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(),
+            audio_input=room_io.AudioInputOptions(sample_rate=48000),
+            audio_output=room_io.AudioOutputOptions(sample_rate=48000),
             text_output=room_io.TextOutputOptions(sync_transcription=True),
         ),
     )
