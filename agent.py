@@ -289,8 +289,11 @@ async def _run_session(ctx: JobContext):
     backchannel_rule = ""
     if _backchannel_enabled_from_room(ctx):
         backchannel_rule = (
-            "\n\nBACKCHANNELING: While the user is speaking, you may use brief verbal affirmations "
-            "(e.g. \"yeah\", \"uh-huh\", \"mm-hmm\", \"right\") to show you are listening. Keep them short and natural."
+            "\n\nBACKCHANNELING (important): When the user is speaking or has just paused mid-thought "
+            "(e.g. ended with \"and\", \"so\", \"but\", or an incomplete sentence), respond with ONLY a very short "
+            "listener cue: \"yeah\", \"uh-huh\", \"mm-hmm\", \"right\", \"mhm\", or \"I see\". Do this DURING the "
+            "conversation whenever the user is sharing a story or long message—offer one short backchannel, then "
+            "let them continue. Keep your full replies for when they ask a direct question or finish a complete thought."
         )
     instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}{backchannel_rule}"
     speak_first = _welcome_mode_from_room(ctx) != "user"
