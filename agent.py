@@ -35,6 +35,13 @@ from livekit.agents import (
     metrics,
     room_io,
 )
+
+try:
+    from livekit.agents import AudioConfig, BackgroundAudioPlayer, BuiltinAudioClip
+except ImportError:
+    AudioConfig = None
+    BackgroundAudioPlayer = None
+    BuiltinAudioClip = None
 from livekit.agents.beta.tools.end_call import EndCallTool
 from livekit.agents.llm import function_tool
 from livekit.plugins import cartesia, silero
@@ -158,6 +165,24 @@ def _call_options_from_room(ctx: JobContext) -> dict:
         }
     except Exception:
         return {}
+
+
+def _background_audio_from_room(ctx: JobContext) -> dict:
+    """Read agent.backgroundAudio from room metadata (preset, ambientVolume)."""
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return {"preset": "none", "ambientVolume": 0.7}
+    try:
+        data = json.loads(raw)
+        bg = (data.get("agent") or {}).get("backgroundAudio") or {}
+        preset = str(bg.get("preset") or "none").strip().lower()
+        if preset not in ("office", "keyboard", "office1", "office2"):
+            preset = "none"
+        vol = float(bg.get("ambientVolume", 0.7))
+        vol = max(0.0, min(1.0, vol))
+        return {"preset": preset, "ambientVolume": vol}
+    except Exception:
+        return {"preset": "none", "ambientVolume": 0.7}
 
 
 def _positive_float(val, default: float) -> float:
@@ -348,18 +373,32 @@ async def _run_session(ctx: JobContext):
 
     backchannel_enabled = _backchannel_enabled_from_room(ctx)
     last_backchannel_at = {"t": 0.0}
-    BACKCHANNEL_INTERVAL = 6.0
-    BACKCHANNEL_MIN_LEN = 25
+    BACKCHANNEL_INTERVAL = 4.0
+    BACKCHANNEL_MIN_LEN = 12
+    BACKCHANNEL_FINAL_MIN_LEN = 40
     BACKCHANNEL_PHRASES = ("Mm-hmm.", "Yeah.", "Uh-huh.", "Right.", "I see.")
 
     def _on_user_input(ev):
-        if getattr(ev, "is_final", True):
+        is_final = getattr(ev, "is_final", getattr(ev, "final", True))
+        transcript = (getattr(ev, "transcript", None) or "").strip()
+        if is_final:
             last_activity["t"] = time.monotonic()
+            if not backchannel_enabled or len(transcript) < BACKCHANNEL_FINAL_MIN_LEN:
+                return
+            now = time.monotonic()
+            if now - last_backchannel_at["t"] < BACKCHANNEL_INTERVAL:
+                return
+            last_backchannel_at["t"] = now
+            phrase = random.choice(BACKCHANNEL_PHRASES)
+            try:
+                logger.info("Backchannel (after final): %s", phrase)
+                out = session.say(phrase)
+                if asyncio.iscoroutine(out):
+                    asyncio.get_running_loop().create_task(out)
+            except Exception as e:
+                logger.debug("Backchannel say failed: %s", e)
             return
-        if not backchannel_enabled:
-            return
-        transcript = getattr(ev, "transcript", None) or ""
-        if len(transcript.strip()) < BACKCHANNEL_MIN_LEN:
+        if not backchannel_enabled or len(transcript) < BACKCHANNEL_MIN_LEN:
             return
         now = time.monotonic()
         if now - last_backchannel_at["t"] < BACKCHANNEL_INTERVAL:
@@ -367,6 +406,7 @@ async def _run_session(ctx: JobContext):
         last_backchannel_at["t"] = now
         phrase = random.choice(BACKCHANNEL_PHRASES)
         try:
+            logger.info("Backchannel (interim): %s", phrase)
             out = session.say(phrase)
             if asyncio.iscoroutine(out):
                 asyncio.get_running_loop().create_task(out)
@@ -415,6 +455,40 @@ async def _run_session(ctx: JobContext):
     if (call_opts.get("max_call_duration_minutes") or 0) > 0 or (call_opts.get("inactivity_check_seconds") or 0) > 0:
         loop_task = asyncio.create_task(_inactivity_and_max_duration_loop())
         ctx.add_shutdown_callback(lambda: loop_task.cancel() if loop_task else None)
+
+    bg_audio_task: asyncio.Task | None = None
+    if BackgroundAudioPlayer and AudioConfig and BuiltinAudioClip:
+        bg = _background_audio_from_room(ctx)
+        preset = bg.get("preset") or "none"
+        vol = float(bg.get("ambientVolume", 0.7))
+        if preset != "none" and vol > 0:
+            try:
+                if preset == "office":
+                    ambient = AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=vol)
+                elif preset == "keyboard":
+                    ambient = AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING, volume=vol)
+                elif preset == "office1":
+                    audio_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio")
+                    path = os.path.join(audio_dir, "Office1.mp3")
+                    ambient = AudioConfig(path, volume=vol)
+                elif preset == "office2":
+                    audio_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio")
+                    path = os.path.join(audio_dir, "Office2.mp3")
+                    ambient = AudioConfig(path, volume=vol)
+                else:
+                    ambient = None
+                if ambient is not None:
+                    background_audio = BackgroundAudioPlayer(ambient_sound=ambient)
+                    async def _start_bg_audio():
+                        await asyncio.sleep(0.5)
+                        try:
+                            await background_audio.start(room=ctx.room, agent_session=session)
+                        except Exception as e:
+                            logger.warning("Background audio start failed: %s", e)
+                    bg_audio_task = asyncio.create_task(_start_bg_audio())
+                    ctx.add_shutdown_callback(lambda: bg_audio_task.cancel() if bg_audio_task else None)
+            except Exception as e:
+                logger.warning("Background audio setup failed: %s", e)
 
     await session.start(
         agent=VoiceAgent(instructions=instructions, speak_first=speak_first, tools=tool_list),
