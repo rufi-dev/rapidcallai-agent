@@ -316,11 +316,12 @@ async def _run_session(ctx: JobContext):
         "You are a helpful voice assistant. Keep responses concise. "
         "Do not use emojis or markdown. Speak naturally for TTS."
     )
-    # Voice-only: no numbered or bullet lists (causes robotic pauses on web). Use flowing sentences.
-    # Continuous speech reduces chunk-boundary artifacts and improves streaming quality.
+
     voice_rules = (
         "VOICE OUTPUT: Reply in short, flowing sentences. Do not use numbered lists (1. 2. 3.) "
         "or bullet points; they cause long pauses when spoken. Say the same content in plain prose. "
+        "Use natural, conversational language as in a real phone call—avoid formal or written-style "
+        "phrasing unless explicitly instructed."
         "Generate speech in full continuous sentences without micro-pauses between phrases; "
         "ensure stable prosody and consistent volume across the full utterance."
     )
