@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import time
 from collections.abc import AsyncIterable
 
@@ -345,9 +346,32 @@ async def _run_session(ctx: JobContext):
     session_start = time.monotonic()
     inactivity_prompted_at: float | None = None
 
+    backchannel_enabled = _backchannel_enabled_from_room(ctx)
+    last_backchannel_at = {"t": 0.0}
+    BACKCHANNEL_INTERVAL = 6.0
+    BACKCHANNEL_MIN_LEN = 25
+    BACKCHANNEL_PHRASES = ("Mm-hmm.", "Yeah.", "Uh-huh.", "Right.", "I see.")
+
     def _on_user_input(ev):
         if getattr(ev, "is_final", True):
             last_activity["t"] = time.monotonic()
+            return
+        if not backchannel_enabled:
+            return
+        transcript = getattr(ev, "transcript", None) or ""
+        if len(transcript.strip()) < BACKCHANNEL_MIN_LEN:
+            return
+        now = time.monotonic()
+        if now - last_backchannel_at["t"] < BACKCHANNEL_INTERVAL:
+            return
+        last_backchannel_at["t"] = now
+        phrase = random.choice(BACKCHANNEL_PHRASES)
+        try:
+            out = session.say(phrase)
+            if asyncio.iscoroutine(out):
+                asyncio.get_running_loop().create_task(out)
+        except Exception as e:
+            logger.debug("Backchannel say failed: %s", e)
 
     try:
         session.on("user_input_transcribed", _on_user_input)
