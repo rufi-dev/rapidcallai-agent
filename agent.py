@@ -211,6 +211,47 @@ def _positive_float(val, default: float) -> float:
         return default
 
 
+def _call_settings_from_room(ctx: JobContext) -> dict:
+    """Read agent.callSettings from room metadata (voicemail detection, response, message)."""
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        cs = (data.get("agent") or {}).get("callSettings") or {}
+        return cs if isinstance(cs, dict) else {}
+    except Exception:
+        return {}
+
+
+def _fallback_voice_from_room(ctx: JobContext) -> dict | None:
+    """Read agent.fallbackVoice from room metadata (provider, voiceId, model)."""
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        fv = (data.get("agent") or {}).get("fallbackVoice")
+        return fv if isinstance(fv, dict) and fv else None
+    except Exception:
+        return None
+
+
+def _post_call_extraction_from_room(ctx: JobContext) -> tuple[list, str]:
+    """Read agent.postCallDataExtraction and postCallExtractionModel from room metadata."""
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return [], ""
+    try:
+        data = json.loads(raw)
+        agent = data.get("agent") or {}
+        items = agent.get("postCallDataExtraction")
+        model = str(agent.get("postCallExtractionModel") or "").strip()
+        return (items if isinstance(items, list) else []), model
+    except Exception:
+        return [], ""
+
+
 def _build_stt(ctx: JobContext):
     """STT from room metadata: use NVIDIA when voice.provider is nvidia, else Deepgram."""
     voice_cfg = _voice_from_room(ctx)
@@ -222,14 +263,13 @@ def _build_stt(ctx: JobContext):
 
 
 def _build_tts(ctx: JobContext):
-    """TTS from room metadata voice (provider, model, voiceId) so dashboard voice selection is used."""
+    """TTS from room metadata voice (provider, model, voiceId). callSettings/fallbackVoice/postCallDataExtraction read from metadata for future use."""
     voice_cfg = _voice_from_room(ctx)
     provider = str(voice_cfg.get("provider") or "").strip().lower()
     model = str(voice_cfg.get("model") or "").strip() or "sonic-3"
     voice_id = str(voice_cfg.get("voiceId") or "").strip() or "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
 
     if provider == "nvidia" and nvidia:
-        # NVIDIA TTS: voice is e.g. Magpie-Multilingual.EN-US.Leo or from dashboard
         nvidia_voice = voice_id if voice_id and not voice_id.startswith("96") else "Magpie-Multilingual.EN-US.Leo"
         lang = str(voice_cfg.get("languageCode") or "en-US").strip() or "en-US"
         return nvidia.TTS(voice=nvidia_voice, language_code=lang)
@@ -238,8 +278,6 @@ def _build_tts(ctx: JobContext):
             voice_id=voice_id,
             model=model or "eleven_turbo_v2_5",
         )
-    # text_pacing=False for smoother playback. speed=1.15 for more natural pace (avoids slow, over-stressed intonation).
-    # Prefer 48kHz to match WebRTC; fallback if plugin version doesn't support speed/sample_rate.
     try:
         return cartesia.TTS(
             model=model or "sonic-3",
@@ -357,7 +395,19 @@ async def _run_session(ctx: JobContext):
             "conversation whenever the user is sharing a story or long message—offer one short backchannel, then "
             "let them continue. Keep your full replies for when they ask a direct question or finish a complete thought."
         )
-    instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}{backchannel_rule}"
+    voicemail_rule = ""
+    call_settings = _call_settings_from_room(ctx)
+    if call_settings.get("voicemailDetectionEnabled"):
+        if call_settings.get("voicemailResponse") == "hang_up":
+            voicemail_rule = "\n\nVOICEMAIL: If you are told or detect that the call reached voicemail, say nothing further and call end_call immediately."
+        elif call_settings.get("voicemailResponse") == "leave_message":
+            msg_type = call_settings.get("voicemailMessageType") or "prompt"
+            msg = (call_settings.get("voicemailStaticMessage") or call_settings.get("voicemailPrompt") or "").strip()
+            if msg:
+                voicemail_rule = f"\n\nVOICEMAIL: If you are told or detect that the call reached voicemail, deliver this message once then call end_call: {msg[:500]}"
+            else:
+                voicemail_rule = "\n\nVOICEMAIL: If you are told or detect that the call reached voicemail, leave a brief professional voicemail then call end_call."
+    instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}{backchannel_rule}{voicemail_rule}"
     speak_first = _welcome_mode_from_room(ctx) != "user"
     enabled = _enabled_tools_from_room(ctx)
     tool_list = [EndCallTool()] if "end_call" in enabled else []
