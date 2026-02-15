@@ -35,6 +35,7 @@ from livekit.agents import (
     metrics,
     room_io,
 )
+from livekit.agents.metrics import EOUMetrics, LLMMetrics, TTSMetrics
 
 try:
     from livekit.agents import AudioConfig, BackgroundAudioPlayer, BuiltinAudioClip
@@ -78,6 +79,19 @@ def _mcp_servers():
     except ImportError:
         logger.warning("MCP_SERVER_URL set but livekit-agents[mcp] not installed; pip install 'livekit-agents[mcp]'")
         return []
+
+
+def _call_id_from_room(ctx: JobContext) -> str | None:
+    """Read call id from room metadata (set by server when creating the room)."""
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        call = data.get("call") or {}
+        return call.get("id") if isinstance(call.get("id"), str) else None
+    except Exception:
+        return None
 
 
 def _instructions_from_room(ctx: JobContext) -> str | None:
@@ -373,15 +387,75 @@ async def _run_session(ctx: JobContext):
 
     usage_collector = metrics.UsageCollector()
 
+    # Latency: EOU + LLM ttft + TTS ttfb (see https://docs.livekit.io/deploy/observability/data/)
+    latency_eou_delays: list[float] = []
+    latency_eou_transcription_delays: list[float] = []
+    latency_llm_ttfts: list[float] = []
+    latency_tts_ttfbs: list[float] = []
+
     @session.on("metrics_collected")
     def _on_metrics(ev: MetricsCollectedEvent):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
+        m = ev.metrics
+        if isinstance(m, EOUMetrics):
+            latency_eou_delays.append(m.end_of_utterance_delay)
+            latency_eou_transcription_delays.append(m.transcription_delay)
+        elif isinstance(m, LLMMetrics):
+            latency_llm_ttfts.append(m.ttft)
+        elif isinstance(m, TTSMetrics):
+            latency_tts_ttfbs.append(m.ttfb)
 
     async def log_usage():
         logger.info("Usage: %s", usage_collector.get_summary())
 
     ctx.add_shutdown_callback(log_usage)
+
+    async def _post_latency_metrics():
+        call_id = _call_id_from_room(ctx)
+        base_url = (os.environ.get("SERVER_BASE_URL") or "").strip().rstrip("/")
+        secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
+        if not call_id or not base_url or not secret:
+            return
+        n_eou = len(latency_eou_delays)
+        n_llm = len(latency_llm_ttfts)
+        n_tts = len(latency_tts_ttfbs)
+        if n_eou == 0 and n_llm == 0 and n_tts == 0:
+            return
+        eou_avg = sum(latency_eou_delays) / n_eou if n_eou else 0.0
+        eou_trans_avg = sum(latency_eou_transcription_delays) / n_eou if n_eou else 0.0
+        llm_ttft_avg = sum(latency_llm_ttfts) / n_llm if n_llm else 0.0
+        tts_ttfb_avg = sum(latency_tts_ttfbs) / n_tts if n_tts else 0.0
+        # Total conversation latency (seconds -> ms): eou + llm ttft + tts ttfb
+        agent_turn_ms = (eou_avg + llm_ttft_avg + tts_ttfb_avg) * 1000.0
+        payload = {
+            "latency": {
+                "eou_end_ms_avg": round(eou_avg * 1000.0),
+                "eou_transcription_ms_avg": round(eou_trans_avg * 1000.0),
+                "llm_ttft_ms_avg": round(llm_ttft_avg * 1000.0),
+                "agent_turn_latency_ms_avg": round(agent_turn_ms),
+            }
+        }
+        url = f"{base_url}/api/calls/{call_id}/metrics"
+        try:
+            import requests
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.post(
+                    url,
+                    json=payload,
+                    headers={"x-agent-secret": secret, "content-type": "application/json"},
+                    timeout=10,
+                ),
+            )
+            if resp.status_code >= 400:
+                logger.warning("POST %s failed: %s %s", url, resp.status_code, resp.text[:200])
+            else:
+                logger.info("Posted latency metrics for call %s", call_id)
+        except Exception as e:
+            logger.warning("Failed to post latency metrics: %s", e)
+
+    ctx.add_shutdown_callback(_post_latency_metrics)
 
     # Inactivity and max call duration (from room metadata agent.callOptions)
     call_opts = _call_options_from_room(ctx)
