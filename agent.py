@@ -152,6 +152,22 @@ def _extract_knowledge_folder_ids_from_room(ctx: JobContext) -> list[str]:
 # Custom audio files (Office1.mp3, Office2.mp3) live in python-agent/audio/.
 _AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio")
 
+
+def _log_audio_dir_once():
+    """Log custom audio dir and file existence once at first use (helps debug deployed agent)."""
+    if getattr(_log_audio_dir_once, "_done", False):
+        return
+    _log_audio_dir_once._done = True
+    try:
+        exists = os.path.isdir(_AUDIO_DIR)
+        logger.info("Background audio dir: %s (exists=%s)", _AUDIO_DIR, exists)
+        if exists:
+            for f in ("Office1.mp3", "Office2.mp3"):
+                p = os.path.join(_AUDIO_DIR, f)
+                logger.info("  %s: %s", f, "found" if os.path.isfile(p) else "MISSING")
+    except Exception as e:
+        logger.warning("Could not check audio dir: %s", e)
+
 # Mapping of user-facing background audio option keys to BuiltinAudioClip or custom file + defaults.
 # For "office1" / "office2", preset uses "ambient_file" (filename in audio/); agent resolves path at runtime.
 BACKGROUND_AUDIO_OPTIONS: dict[str, dict] = {
@@ -226,11 +242,13 @@ def _build_background_audio_player(bg_cfg: dict | None) -> BackgroundAudioPlayer
     ambient_sound = None
     if preset.get("ambient_file"):
         # Custom MP3 in python-agent/audio/
+        _log_audio_dir_once()
         fname = preset["ambient_file"]
-        path = os.path.join(_AUDIO_DIR, fname)
+        path = os.path.abspath(os.path.join(_AUDIO_DIR, fname))
         if not os.path.isfile(path):
-            logger.warning("Background audio file not found: %s", path)
+            logger.warning("Background audio file not found: path=%s (preset=%s)", path, preset_key)
             return None
+        logger.info("Background audio using custom file: %s", path)
         ambient_sound = AudioConfig(path, volume=max(0.0, min(1.0, ambient_vol)))
     elif preset.get("ambient") is not None:
         ambient_sound = AudioConfig(preset["ambient"], volume=max(0.0, min(1.0, ambient_vol)))
@@ -574,20 +592,26 @@ def prewarm(proc: JobProcess):
             proc.userdata["tts_model_name"] = f"cartesia/{os.environ.get('CARTESIA_TTS_MODEL', 'sonic-2')}"
         else:
             # Defaults based on LiveKit ElevenLabs plugin docs.
-            # Use eleven_turbo_v2_5 for better quality over phone (vs speed-optimized flash)
             voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL").strip()
             model = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5").strip()
-            # ElevenLabs plugin expects api_key via arg or ELEVEN_API_KEY env var, but many setups
-            # already have ELEVENLABS_API_KEY configured. Support both to avoid crash-loops.
             api_key = (
                 os.environ.get("ELEVEN_API_KEY", "").strip()
                 or os.environ.get("ELEVENLABS_API_KEY", "").strip()
             )
             if api_key:
                 proc.userdata["tts"] = elevenlabs.TTS(voice_id=voice_id, model=model, api_key=api_key)
+                proc.userdata["tts_model_name"] = f"elevenlabs/{model}"
             else:
-                proc.userdata["tts"] = elevenlabs.TTS(voice_id=voice_id, model=model)
-            proc.userdata["tts_model_name"] = f"elevenlabs/{model}"
+                # No ElevenLabs key: use Cartesia so the agent can speak (avoids "no audio frames were pushed")
+                logger.warning(
+                    "TTS_BACKEND=elevenlabs but ELEVEN_API_KEY (and ELEVENLABS_API_KEY) not set; using Cartesia TTS"
+                )
+                proc.userdata["tts"] = cartesia.TTS(
+                    model=os.environ.get("CARTESIA_TTS_MODEL", "sonic-2"),
+                    voice=os.environ.get("CARTESIA_VOICE", "a0e99841-438c-4a64-b679-ae501e7d6091"),
+                    text_pacing=True,
+                )
+                proc.userdata["tts_model_name"] = f"cartesia/{os.environ.get('CARTESIA_TTS_MODEL', 'sonic-2')}"
     else:
         proc.userdata["tts"] = cartesia.TTS(
             model=os.environ.get("CARTESIA_TTS_MODEL", "sonic-2"),
@@ -1106,7 +1130,7 @@ async def _entrypoint_impl(ctx: JobContext):
             bg_player_started = True
             logger.info("Background audio started: preset=%s", bg_audio_cfg.get("preset") if isinstance(bg_audio_cfg, dict) else "?")
         except Exception as e:
-            logger.warning("Failed to start background audio: %s", e)
+            logger.warning("Failed to start background audio: %s", e, exc_info=True)
     elif bg_audio_cfg and isinstance(bg_audio_cfg, dict) and str(bg_audio_cfg.get("preset") or "").strip().lower() not in ("", "none"):
         logger.info("Background audio skipped: preset=%s not in (office, keyboard)", bg_audio_cfg.get("preset"))
 

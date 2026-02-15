@@ -64,6 +64,14 @@ If you call your inbound number and **no new lines** appear in the agent termina
 4. **Room created?**  
    In **LiveKit Cloud** → your project → **Rooms** (or Telephony), place a test call and check whether a **room** is created (e.g. `call-+...`). If no room appears, the call is not reaching LiveKit (check Twilio origination). If a room appears but no agent joins, the dispatch rule or agent name may not match.
 
+### "failed to synthesize speech" / "no audio frames were pushed" (agent has no voice)
+
+The agent hears you (STT works) and the LLM replies, but **no speech** is played. The log shows `livekit.plugins.elevenlabs.tts.TTS` and `APIError: no audio frames were pushed for text: ...`.
+
+**Cause:** ElevenLabs TTS is not returning audio. Common reasons: missing/invalid `ELEVEN_API_KEY` or `ELEVENLABS_API_KEY`, quota exceeded, or invalid voice ID.
+
+**Quick fix — use Cartesia instead:** In `python-agent/.env` set `TTS_BACKEND=cartesia` and `CARTESIA_API_KEY=<your key>`, then restart the agent. If no ElevenLabs key is set, the agent already falls back to Cartesia automatically.
+
 ### Agent can’t post metrics
 
 If the agent runs in LiveKit Cloud, it cannot reach `http://localhost:8787`.
