@@ -27,9 +27,14 @@ from livekit.agents import (
 )
 from livekit.agents.beta.tools.end_call import EndCallTool
 from livekit.agents.llm import function_tool
-from livekit.plugins import silero
+from livekit.plugins import cartesia, silero
 from livekit import rtc
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+try:
+    from livekit.plugins import elevenlabs
+except Exception:
+    elevenlabs = None
 
 load_dotenv()
 logger = logging.getLogger("agent")
@@ -75,14 +80,60 @@ def _welcome_mode_from_room(ctx: JobContext) -> str:
         return "ai"
 
 
-class VoiceAgent(Agent):
-    """Single agent with instructions and end_call tool (per LiveKit docs)."""
+def _voice_from_room(ctx: JobContext) -> dict:
+    """Read agent.voice from room metadata so dashboard voice selection is used."""
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        v = (data.get("agent") or {}).get("voice")
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
 
-    def __init__(self, instructions: str, speak_first: bool = True) -> None:
-        super().__init__(
-            instructions=instructions,
-            tools=[EndCallTool()],
+
+def _enabled_tools_from_room(ctx: JobContext) -> list[str]:
+    """Read agent.enabledTools from room metadata (dashboard Tools tab). Default: end_call only."""
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return ["end_call"]
+    try:
+        data = json.loads(raw)
+        t = (data.get("agent") or {}).get("enabledTools")
+        if isinstance(t, list):
+            return [str(x).strip() for x in t if isinstance(x, str) and x.strip()]
+        return ["end_call"]
+    except Exception:
+        return ["end_call"]
+
+
+def _build_tts(ctx: JobContext):
+    """TTS from room metadata voice (provider, model, voiceId) so dashboard voice selection is used."""
+    voice_cfg = _voice_from_room(ctx)
+    provider = str(voice_cfg.get("provider") or "").strip().lower()
+    model = str(voice_cfg.get("model") or "").strip() or "sonic-3"
+    voice_id = str(voice_cfg.get("voiceId") or "").strip() or "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+
+    if provider == "elevenlabs" and elevenlabs and voice_id:
+        return elevenlabs.TTS(
+            voice_id=voice_id,
+            model=model or "eleven_turbo_v2_5",
         )
+    return cartesia.TTS(model=model or "sonic-3", voice=voice_id, text_pacing=True)
+
+
+class VoiceAgent(Agent):
+    """Single agent with instructions and tools from dashboard (end_call, lookup_weather)."""
+
+    def __init__(
+        self,
+        instructions: str,
+        speak_first: bool = True,
+        tools: list | None = None,
+    ) -> None:
+        tools = tools or [EndCallTool()]
+        super().__init__(instructions=instructions, tools=tools)
         self._speak_first = speak_first
 
     async def on_enter(self):
@@ -133,12 +184,15 @@ async def _run_session(ctx: JobContext):
     )
     instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}"
     speak_first = _welcome_mode_from_room(ctx) != "user"
+    enabled = _enabled_tools_from_room(ctx)
+    tool_list = [EndCallTool()] if "end_call" in enabled else []
+    # lookup_weather is on VoiceAgent as @function_tool; add agent only if that tool is enabled
+    tts_obj = _build_tts(ctx)
 
-    # Session options from basic_agent + docs (preemptive_generation, resume_false_interruption).
     session = AgentSession(
         stt=inference.STT("deepgram/nova-3", language="multi"),
         llm=inference.LLM("openai/gpt-4.1-mini"),
-        tts=inference.TTS("cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
+        tts=tts_obj,
         vad=ctx.proc.userdata["vad"],
         turn_detection=MultilingualModel(),
         preemptive_generation=True,
@@ -171,7 +225,7 @@ async def _run_session(ctx: JobContext):
     ctx.add_shutdown_callback(log_usage)
 
     await session.start(
-        agent=VoiceAgent(instructions=instructions, speak_first=speak_first),
+        agent=VoiceAgent(instructions=instructions, speak_first=speak_first, tools=tool_list),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(),

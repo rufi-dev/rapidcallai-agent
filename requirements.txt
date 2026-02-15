@@ -9,7 +9,38 @@ livekit-plugins-turn-detector>=1.3.10,<2.0.0
 livekit-plugins-noise-cancellation>=0.2.5
 python-dotenv>=1.0.1
 requests>=2.28.0
-# Optional: pip install 'livekit-agents[mcp]' for MCP server integration
-# For running mcp_server.py: pip install mcp
+
+# Optional: MCP and extra plugins (uncomment as needed)
+# pip install 'livekit-agents[mcp]'   # MCP server integration
+# pip install mcp                     # For running mcp_server.py
+# livekit-plugins-anthropic>=1.3.10
+# livekit-plugins-assemblyai>=1.3.10
+# livekit-plugins-google>=1.3.10
+# livekit-plugins-groq>=1.3.10
+# livekit-plugins-mistralai>=1.3.10
+# livekit-plugins-nvidia>=1.3.10
+# livekit-plugins-rime>=1.3.10
+# livekit-plugins-azure>=1.3.10
+# livekit-plugins-aws>=1.3.10
+# livekit-plugins-hume>=1.3.10
+# livekit-plugins-inworld>=1.3.10
+# livekit-plugins-langchain>=1.3.10
+# livekit-plugins-speechmatics>=1.3.10
+# livekit-plugins-gladia>=1.3.10
+# livekit-plugins-soniox>=1.3.10
+# livekit-plugins-fishaudio>=1.3.10
+# livekit-plugins-resemble>=1.3.10
+# livekit-plugins-playht>=1.3.10
+# livekit-plugins-lmnt>=1.3.10
+# livekit-plugins-neuphonic>=1.3.10
+# livekit-plugins-xai>=1.3.10
+# livekit-plugins-fireworksai>=1.3.10
+# livekit-plugins-fal>=1.3.10
+# livekit-plugins-baseten>=1.3.10
+# livekit-plugins-minimax>=1.3.10
+# livekit-plugins-simplismart>=1.3.10
+# livekit-plugins-sarvam>=1.3.10
+# livekit-plugins-clova>=1.3.10
+# livekit-plugins-ultravox>=1.3.10
 
 
