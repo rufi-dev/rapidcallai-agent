@@ -456,6 +456,12 @@ class VoiceAgent(Agent):
         call_id = call.get("id")
         base_url = (os.environ.get("SERVER_BASE_URL") or "").strip().rstrip("/")
         secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
+        logger.info(
+            "transfer_call invoked: call_id=%s transfer_to=%s base_url_set=%s",
+            call_id,
+            transfer_to,
+            bool(base_url),
+        )
         if not call_id or not base_url or not secret:
             msg = "Transfer service unavailable. Please inform the customer and offer to try again or help them directly."
             result = {"status": "error", "message": msg}
@@ -474,6 +480,7 @@ class VoiceAgent(Agent):
                     timeout=15,
                 ),
             )
+            logger.info("transfer_call response: status=%s body=%s", resp.status_code, (resp.text or "")[:200])
             if resp.status_code == 200:
                 result = {"status": "transferred", "execution_message": execution_message}
                 if entries is not None:
@@ -789,7 +796,7 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
 
     async def _transcript_sync_loop() -> None:
         while True:
-            await asyncio.sleep(10.0)
+            await asyncio.sleep(5.0)
             await _sync_transcript_to_server()
 
     try:
