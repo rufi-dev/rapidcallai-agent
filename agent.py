@@ -455,6 +455,95 @@ def prewarm(proc: JobProcess):
 server.setup_fnc = prewarm
 
 
+def _room_has_agent_config(ctx: JobContext) -> bool:
+    """True if room metadata already has agent.prompt (e.g. webtest or outbound, or inbound already started)."""
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return False
+    try:
+        data = json.loads(raw)
+        prompt = (data.get("agent") or {}).get("prompt")
+        return bool(isinstance(prompt, str) and prompt.strip())
+    except Exception:
+        return False
+
+
+def _get_inbound_to_from(ctx: JobContext) -> tuple[str | None, str | None]:
+    """
+    Try to get (to, from) for inbound/start from room name or participants.
+    to = trunk number that was dialed, from = caller. Returns (None, None) if we can't get both.
+    """
+    import re
+    room_name = getattr(ctx.room, "name", None) or ""
+    # E.164-like: + followed by 10-15 digits
+    parts = re.findall(r"\+\d{10,15}", room_name)
+    if len(parts) >= 2:
+        return (parts[0], parts[1])
+    if len(parts) == 1:
+        # One number only - could be caller (from). Try to get 'to' from first remote participant metadata.
+        from_num = parts[0]
+        for p in getattr(ctx.room, "remote_participants", {}).values():
+            identity = (getattr(p, "identity", None) or "") or ""
+            meta = getattr(p, "metadata", None) or ""
+            # Some SIP setups put trunk number in identity or metadata
+            for raw in (identity, meta):
+                m = re.search(r"\+\d{10,15}", raw)
+                if m and m.group(0) != from_num:
+                    return (m.group(0), from_num)
+        return (None, from_num)
+    for p in getattr(ctx.room, "remote_participants", {}).values():
+        identity = (getattr(p, "identity", None) or "") or ""
+        found = re.findall(r"\+\d{10,15}", identity)
+        if len(found) >= 2:
+            return (found[0], found[1])
+        if len(found) == 1:
+            return (found[0], found[0])  # use same as both when only one available (best effort)
+    return (None, None)
+
+
+async def _ensure_inbound_config(ctx: JobContext) -> None:
+    """
+    For inbound telephony: if room has no agent config, call the server's inbound/start
+    so it creates the call record and updates room metadata (prompt, voice, tools).
+    Requires SERVER_BASE_URL and AGENT_SHARED_SECRET. to/from are derived from room name or participants.
+    """
+    if _room_has_agent_config(ctx):
+        return
+    base_url = (os.environ.get("SERVER_BASE_URL") or os.environ.get("PUBLIC_API_BASE_URL") or "").strip().rstrip("/")
+    secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
+    if not base_url or not secret:
+        logger.debug("Inbound config: skip (no SERVER_BASE_URL or AGENT_SHARED_SECRET)")
+        return
+    to, from_ = _get_inbound_to_from(ctx)
+    if not to:
+        logger.debug("Inbound config: skip (could not get 'to' from room name or participants)")
+        return
+    room_name = getattr(ctx.room, "name", None) or ""
+    if not room_name:
+        return
+    url = f"{base_url}/api/internal/telephony/inbound/start"
+    try:
+        import requests
+        body = {"roomName": room_name, "to": to, "from": from_ or ""}
+        resp = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: requests.post(
+                url,
+                json=body,
+                headers={"x-agent-secret": secret, "content-type": "application/json"},
+                timeout=10,
+            ),
+        )
+        if resp.status_code in (200, 201):
+            logger.info("Inbound config: fetched and room metadata updated for %s", room_name)
+            # Give LiveKit a moment to push metadata to this participant
+            await asyncio.sleep(0.3)
+        else:
+            logger.warning("Inbound config: POST %s returned %s %s", url, resp.status_code, (resp.text or "")[:200])
+    except Exception as e:
+        logger.warning("Inbound config: failed to call inbound/start: %s", e)
+
+
 async def _run_session(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
@@ -936,10 +1025,12 @@ async def _run_session(ctx: JobContext):
 if LIVEKIT_AGENT_NAME:
     @server.rtc_session(agent_name=LIVEKIT_AGENT_NAME)
     async def entrypoint(ctx: JobContext):
+        await _ensure_inbound_config(ctx)
         await _run_session(ctx)
 else:
     @server.rtc_session()
     async def entrypoint(ctx: JobContext):
+        await _ensure_inbound_config(ctx)
         await _run_session(ctx)
 
 
