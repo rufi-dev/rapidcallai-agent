@@ -15,6 +15,7 @@ import logging
 import os
 import random
 import time
+import uuid
 from collections.abc import AsyncIterable
 
 from dotenv import load_dotenv
@@ -342,13 +343,105 @@ class VoiceAgent(Agent):
             yield filler
             yield FlushSentinel()
 
+    def _room_metadata(self, context: RunContext) -> dict:
+        """Read room metadata (call.to, agent.toolConfigs, etc.) for use in tools."""
+        raw = getattr(getattr(context, "room", None), "metadata", None) or ""
+        try:
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
     @function_tool
     async def lookup_weather(
         self, context: RunContext, location: str, latitude: str, longitude: str
     ) -> str:
         """Called when the user asks for weather. Provide location; do not ask for lat/long."""
         logger.info("lookup_weather: %s", location)
-        return "Sunny, 70°F."
+        entries = getattr(self, "transcript_entries", None)
+        tid = uuid.uuid4().hex[:16]
+        inp = {"location": location, "latitude": latitude, "longitude": longitude}
+        if entries is not None:
+            entries.append({"kind": "tool_invocation", "toolCallId": tid, "toolName": "lookup_weather", "input": inp})
+        result_str = "Sunny, 70°F."
+        if entries is not None:
+            entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "lookup_weather", "result": {"response": result_str}})
+        return result_str
+
+    @function_tool
+    async def transfer_call(
+        self, context: RunContext, execution_message: str = "Connecting you now."
+    ) -> str:
+        """Transfer the call to another number (e.g. live agent). Use when the user asks to be transferred. Provide a brief execution_message to say while transferring."""
+        entries = getattr(self, "transcript_entries", None)
+        meta = self._room_metadata(context)
+        call = meta.get("call") or {}
+        to_dest = call.get("to") or ""
+        is_web = str(to_dest).strip().lower() == "webtest"
+        agent_cfg = meta.get("agent") or {}
+        tool_configs = agent_cfg.get("toolConfigs") or {}
+        transfer_cfg = tool_configs.get("transfer_call") or {}
+        transfer_to = (transfer_cfg.get("transferTo") or "").strip() or None
+
+        tid = uuid.uuid4().hex[:16]
+        inp = {"execution_message": execution_message}
+        if entries is not None:
+            entries.append({"kind": "tool_invocation", "toolCallId": tid, "toolName": "transfer_call", "input": inp})
+
+        if is_web:
+            msg = (
+                "Transfer is not available on web calls. Please inform the customer and offer to help them "
+                "directly or take a callback number."
+            )
+            result = {"status": "unavailable", "message": msg}
+            if entries is not None:
+                entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "transfer_call", "result": result})
+            return msg
+
+        if not transfer_to:
+            msg = "No transfer number configured. Please inform the customer and offer to help them directly or take a callback number."
+            result = {"status": "not_configured", "message": msg}
+            if entries is not None:
+                entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "transfer_call", "result": result})
+            return msg
+
+        call_id = call.get("id")
+        base_url = (os.environ.get("SERVER_BASE_URL") or "").strip().rstrip("/")
+        secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
+        if not call_id or not base_url or not secret:
+            msg = "Transfer service unavailable. Please inform the customer and offer to try again or help them directly."
+            result = {"status": "error", "message": msg}
+            if entries is not None:
+                entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "transfer_call", "result": result})
+            return msg
+
+        try:
+            import requests
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.post(
+                    f"{base_url}/api/internal/calls/{call_id}/transfer",
+                    json={"transferTo": transfer_to},
+                    headers={"x-agent-secret": secret, "content-type": "application/json"},
+                    timeout=15,
+                ),
+            )
+            if resp.status_code == 200:
+                result = {"status": "transferred", "execution_message": execution_message}
+                if entries is not None:
+                    entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "transfer_call", "result": result})
+                return "Transfer initiated. Please inform the customer they are being connected."
+            err = resp.json() if resp.text else {}
+            msg = err.get("message") or err.get("error") or resp.text or "Transfer failed."
+            result = {"status": "failed", "message": msg}
+            if entries is not None:
+                entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "transfer_call", "result": result})
+            return f"Transfer failed: {msg}. Please inform the customer that the transfer did not go through and offer to try again or assist them directly."
+        except Exception as e:
+            msg = str(e)
+            result = {"status": "error", "message": msg}
+            if entries is not None:
+                entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "transfer_call", "result": result})
+            return f"Transfer failed. Please inform the customer that the transfer did not go through and offer to try again or assist them directly."
 
 
 server = AgentServer()
@@ -407,7 +500,16 @@ async def _run_session(ctx: JobContext):
                 voicemail_rule = f"\n\nVOICEMAIL: If you are told or detect that the call reached voicemail, deliver this message once then call end_call: {msg[:500]}"
             else:
                 voicemail_rule = "\n\nVOICEMAIL: If you are told or detect that the call reached voicemail, leave a brief professional voicemail then call end_call."
-    instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}{backchannel_rule}{voicemail_rule}"
+    transfer_call_rule = ""
+    if "transfer_call" in enabled:
+        transfer_call_rule = (
+            "\n\nTRANSFER: You have a transfer_call tool. When the user asks to speak to a person or be transferred, "
+            "use it. If the tool returns that transfer is unavailable or failed, tell the customer clearly (e.g. "
+            "\"Sorry, I couldn't transfer you\" or \"Transfer isn't available on this call\") and offer to help them "
+            "directly or take a callback. Do NOT use end_call when transfer fails—only use end_call when the user "
+            "says goodbye or is done with the conversation."
+        )
+    instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}{transfer_call_rule}{backchannel_rule}{voicemail_rule}"
     speak_first = _welcome_mode_from_room(ctx) != "user"
     enabled = _enabled_tools_from_room(ctx)
 
@@ -445,14 +547,32 @@ async def _run_session(ctx: JobContext):
         except Exception as e:
             logger.warning("Failed to post end call to server: %s", e)
 
+    def _append_end_call_tool_entries() -> None:
+        """Append tool_invocation and tool_result for end_call so they appear in call history (Retell-style)."""
+        call_id = _call_id_from_room(ctx)
+        tid = uuid.uuid4().hex[:16]
+        transcript_entries.append({
+            "kind": "tool_invocation",
+            "toolCallId": tid,
+            "toolName": "end_call",
+            "input": {"execution_message": "Call ended by agent."},
+        })
+        transcript_entries.append({
+            "kind": "tool_result",
+            "toolCallId": tid,
+            "toolName": "end_call",
+            "result": {"execution_message": "Call ended by agent."},
+        })
+
     async def _on_end_call_tool_called(_ev) -> None:
+        _append_end_call_tool_entries()
         await _post_end_call_to_server()
 
     end_call_tool = (
         EndCallTool(on_tool_called=_on_end_call_tool_called) if "end_call" in enabled else None
     )
     tool_list = [end_call_tool] if end_call_tool else []
-    # lookup_weather is on VoiceAgent as @function_tool; add agent only if that tool is enabled
+    # lookup_weather / transfer_call are on VoiceAgent as @function_tool; add agent when enabled
     tts_obj = _build_tts(ctx)
     stt_obj = _build_stt(ctx)
 
@@ -800,8 +920,10 @@ async def _run_session(ctx: JobContext):
             except Exception as e:
                 logger.warning("Background audio setup failed: %s", e)
 
+    agent = VoiceAgent(instructions=instructions, speak_first=speak_first, tools=tool_list)
+    agent.transcript_entries = transcript_entries
     await session.start(
-        agent=VoiceAgent(instructions=instructions, speak_first=speak_first, tools=tool_list),
+        agent=agent,
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(sample_rate=48000),
