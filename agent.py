@@ -430,6 +430,16 @@ class VoiceAgent(Agent):
         tool_configs = agent_cfg.get("toolConfigs") or {}
         transfer_cfg = tool_configs.get("transfer_call") or {}
         transfer_to = (transfer_cfg.get("transferTo") or "").strip() or None
+        call_id = call.get("id")
+
+        logger.info(
+            "[transfer] tool called: call_id=%s to_dest=%s is_web=%s transfer_to=%s has_transfer_cfg=%s",
+            call_id,
+            to_dest or "(empty)",
+            is_web,
+            transfer_to or "(not set)",
+            bool(transfer_cfg),
+        )
 
         tid = uuid.uuid4().hex[:16]
         inp = {"execution_message": execution_message}
@@ -437,6 +447,7 @@ class VoiceAgent(Agent):
             entries.append({"kind": "tool_invocation", "toolCallId": tid, "toolName": "transfer_call", "input": inp})
 
         if is_web:
+            logger.info("[transfer] skipped: reason=web_call to_dest=%s", to_dest)
             msg = (
                 "Transfer is not available on web calls. Please inform the customer and offer to help them "
                 "directly or take a callback number."
@@ -447,21 +458,21 @@ class VoiceAgent(Agent):
             return msg
 
         if not transfer_to:
+            logger.warning("[transfer] skipped: reason=no_transfer_number toolConfigs.transfer_call=%s", transfer_cfg)
             msg = "No transfer number configured. Please inform the customer and offer to help them directly or take a callback number."
             result = {"status": "not_configured", "message": msg}
             if entries is not None:
                 entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "transfer_call", "result": result})
             return msg
 
-        call_id = call.get("id")
         base_url = (os.environ.get("SERVER_BASE_URL") or "").strip().rstrip("/")
         secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
-        logger.info(
-            "transfer_call invoked: call_id=%s transfer_to=%s base_url_set=%s",
-            call_id,
-            transfer_to,
-            bool(base_url),
-        )
+        if not call_id:
+            logger.warning("[transfer] skipped: reason=no_call_id meta.call=%s", call)
+        if not base_url:
+            logger.warning("[transfer] skipped: reason=no_SERVER_BASE_URL")
+        if not secret:
+            logger.warning("[transfer] skipped: reason=no_AGENT_SHARED_SECRET")
         if not call_id or not base_url or not secret:
             msg = "Transfer service unavailable. Please inform the customer and offer to try again or help them directly."
             result = {"status": "error", "message": msg}
@@ -469,6 +480,7 @@ class VoiceAgent(Agent):
                 entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "transfer_call", "result": result})
             return msg
 
+        logger.info("[transfer] calling server: url=%s/api/internal/calls/%s/transfer transferTo=%s", base_url, call_id, transfer_to)
         try:
             import requests
             resp = await asyncio.get_event_loop().run_in_executor(
@@ -480,7 +492,7 @@ class VoiceAgent(Agent):
                     timeout=15,
                 ),
             )
-            logger.info("transfer_call response: status=%s body=%s", resp.status_code, (resp.text or "")[:200])
+            logger.info("[transfer] server response: status=%s body=%s", resp.status_code, (resp.text or "")[:300])
             if resp.status_code == 200:
                 result = {"status": "transferred", "execution_message": execution_message}
                 if entries is not None:
@@ -493,6 +505,7 @@ class VoiceAgent(Agent):
                 entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "transfer_call", "result": result})
             return f"Transfer failed: {msg}. Please inform the customer that the transfer did not go through and offer to try again or assist them directly."
         except Exception as e:
+            logger.exception("[transfer] request failed: %s", e)
             msg = str(e)
             result = {"status": "error", "message": msg}
             if entries is not None:
