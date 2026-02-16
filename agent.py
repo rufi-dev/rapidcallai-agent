@@ -518,24 +518,33 @@ def _room_has_agent_config(ctx: JobContext) -> bool:
 
 def _get_inbound_to_from(ctx: JobContext) -> tuple[str | None, str | None]:
     """
-    Try to get (to, from) for inbound/start from room name or participants.
-    to = trunk number that was dialed, from = caller. With one number we use it as 'to' so we always call the API.
+    Get (to, from) for inbound/start. Prefer LiveKit SIP participant attributes (correct for any dispatch rule):
+    - sip.trunkPhoneNumber = number that was dialed (to)
+    - sip.phoneNumber = caller (from)
+    Fallback: parse room name (works if using Callee dispatch rule where room name contains the called number).
     """
+    # 1) From SIP participant attributes (recommended by LiveKit docs) — works for Individual and Callee rules.
+    try:
+        kind_sip = getattr(rtc.ParticipantKind, "PARTICIPANT_KIND_SIP", None)
+        for p in getattr(ctx.room, "remote_participants", {}).values():
+            if getattr(p, "kind", None) != kind_sip:
+                continue
+            attrs = getattr(p, "attributes", None) or {}
+            to_num = (attrs.get("sip.trunkPhoneNumber") or "").strip()
+            from_num = (attrs.get("sip.phoneNumber") or "").strip()
+            if to_num:
+                return (to_num, from_num)
+    except Exception as e:
+        logger.debug("Reading SIP attributes: %s", e)
+    # 2) Room name: with Callee rule room can be "number-+15551234567" or "call-+15551234567-abc"; with Individual it's caller number.
     import re
     room_name = getattr(ctx.room, "name", None) or ""
     parts = re.findall(r"\+\d{10,15}", room_name)
     if len(parts) >= 2:
         return (parts[0], parts[1])
     if len(parts) == 1:
-        # Single number: use as 'to' (trunk that was dialed) so we always call inbound/start and get agent config.
+        # Callee-style "call-+NUMBER" → that's the dialed number (to). Individual-style has caller number only (we'd need trunk from attributes).
         return (parts[0], "")
-    for p in getattr(ctx.room, "remote_participants", {}).values():
-        identity = (getattr(p, "identity", None) or "") or ""
-        found = re.findall(r"\+\d{10,15}", identity)
-        if len(found) >= 2:
-            return (found[0], found[1])
-        if len(found) == 1:
-            return (found[0], "")
     return (None, None)
 
 
@@ -586,14 +595,19 @@ async def _ensure_inbound_config(ctx: JobContext) -> dict | None:
 async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
     ctx.log_context_fields = {"room": ctx.room.name}
 
-    # So all _*_from_room helpers and tools use API response instead of room metadata (no propagation delay).
+    # Connect first so we can read SIP participant attributes (sip.trunkPhoneNumber, sip.phoneNumber) for inbound/start.
+    await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_NONE)
+
+    # Give SIP participant a moment to appear in remote_participants so we can read sip.trunkPhoneNumber / sip.phoneNumber.
+    if inbound_config is None and not _room_has_agent_config(ctx):
+        await asyncio.sleep(0.5)
+    # For inbound telephony: fetch agent config from our API using (to, from) from SIP attributes. Use response directly.
+    if inbound_config is None and not _room_has_agent_config(ctx):
+        inbound_config = await _ensure_inbound_config(ctx)
     if inbound_config is not None:
         ud = getattr(ctx.proc, "userdata", None)
         if isinstance(ud, dict):
             ud["inbound_config"] = inbound_config
-
-    # Connect with SUBSCRIBE_NONE so session manages audio (avoids agent not hearing user on web).
-    await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_NONE)
 
     base = _instructions_from_room(ctx) or (
         "You are a helpful voice assistant. Keep responses concise. "
@@ -1075,13 +1089,11 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
 if LIVEKIT_AGENT_NAME:
     @server.rtc_session(agent_name=LIVEKIT_AGENT_NAME)
     async def entrypoint(ctx: JobContext):
-        inbound_config = await _ensure_inbound_config(ctx)
-        await _run_session(ctx, inbound_config=inbound_config)
+        await _run_session(ctx)
 else:
     @server.rtc_session()
     async def entrypoint(ctx: JobContext):
-        inbound_config = await _ensure_inbound_config(ctx)
-        await _run_session(ctx, inbound_config=inbound_config)
+        await _run_session(ctx)
 
 
 if __name__ == "__main__":
