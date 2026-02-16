@@ -812,9 +812,13 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
             await asyncio.sleep(5.0)
             await _sync_transcript_to_server()
 
+    def _cancel_transcript_sync():
+        if _transcript_sync_task:
+            _transcript_sync_task.cancel()
+
     try:
         _transcript_sync_task = asyncio.create_task(_transcript_sync_loop())
-        ctx.add_shutdown_callback(lambda: _transcript_sync_task.cancel() if _transcript_sync_task else None)
+        ctx.add_shutdown_callback(_cancel_transcript_sync)
     except Exception as e:
         logger.debug("Could not start transcript sync task: %s", e)
 
@@ -983,8 +987,12 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
             except Exception as e:
                 logger.warning("Periodic latency post failed: %s", e)
 
+    def _cancel_latency_task():
+        if _latency_task:
+            _latency_task.cancel()
+
     _latency_task = asyncio.create_task(_periodic_latency_post())
-    ctx.add_shutdown_callback(lambda: _latency_task.cancel() if _latency_task else None)
+    ctx.add_shutdown_callback(_cancel_latency_task)
 
     # Inactivity and max call duration (from room metadata agent.callOptions)
     call_opts = _call_options_from_room(ctx)
@@ -1072,10 +1080,14 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
             else:
                 inactivity_prompted_at = None
 
+    def _cancel_loop_task():
+        if loop_task:
+            loop_task.cancel()
+
     loop_task: asyncio.Task | None = None
     if (call_opts.get("max_call_duration_minutes") or 0) > 0 or (call_opts.get("inactivity_check_seconds") or 0) > 0:
         loop_task = asyncio.create_task(_inactivity_and_max_duration_loop())
-        ctx.add_shutdown_callback(lambda: loop_task.cancel() if loop_task else None)
+        ctx.add_shutdown_callback(_cancel_loop_task)
 
     bg_audio_task: asyncio.Task | None = None
     if BackgroundAudioPlayer and AudioConfig and BuiltinAudioClip:
@@ -1106,8 +1118,12 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
                             await background_audio.start(room=ctx.room, agent_session=session)
                         except Exception as e:
                             logger.warning("Background audio start failed: %s", e)
+                    def _cancel_bg_audio():
+                        if bg_audio_task:
+                            bg_audio_task.cancel()
+
                     bg_audio_task = asyncio.create_task(_start_bg_audio())
-                    ctx.add_shutdown_callback(lambda: bg_audio_task.cancel() if bg_audio_task else None)
+                    ctx.add_shutdown_callback(_cancel_bg_audio)
             except Exception as e:
                 logger.warning("Background audio setup failed: %s", e)
 
