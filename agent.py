@@ -319,17 +319,18 @@ def _build_tts(ctx: JobContext):
             voice_id=voice_id,
             model=model or "eleven_turbo_v2_5",
         )
+    # speed=1.0 for more stable audio (less breaking/artifacts on phone)
     try:
         return cartesia.TTS(
             model=model or "sonic-3",
             voice=voice_id,
             text_pacing=False,
             sample_rate=48000,
-            speed=1.15,
+            speed=1.0,
         )
     except TypeError:
         try:
-            return cartesia.TTS(model=model or "sonic-3", voice=voice_id, text_pacing=False, speed=1.15)
+            return cartesia.TTS(model=model or "sonic-3", voice=voice_id, text_pacing=False, speed=1.0)
         except TypeError:
             return cartesia.TTS(model=model or "sonic-3", voice=voice_id, text_pacing=False)
 
@@ -796,6 +797,28 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
         ctx.add_shutdown_callback(lambda: _transcript_sync_task.cancel() if _transcript_sync_task else None)
     except Exception as e:
         logger.debug("Could not start transcript sync task: %s", e)
+
+    def _on_shutdown_push_transcript():
+        """On shutdown (e.g. user hung up), push transcript once so call detail has full transcript."""
+        if not transcript_entries:
+            return
+        call_id = _call_id_from_room(ctx)
+        base_url = (os.environ.get("SERVER_BASE_URL") or "").strip().rstrip("/")
+        secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
+        if not call_id or not base_url or not secret:
+            return
+        try:
+            import requests
+            requests.post(
+                f"{base_url}/api/internal/calls/{call_id}/transcript",
+                json={"transcript": list(transcript_entries)},
+                headers={"x-agent-secret": secret, "content-type": "application/json"},
+                timeout=5,
+            )
+            logger.info("Shutdown: pushed transcript (%d entries) for call %s", len(transcript_entries), call_id)
+        except Exception as e:
+            logger.warning("Shutdown: failed to push transcript: %s", e)
+    ctx.add_shutdown_callback(_on_shutdown_push_transcript)
 
     # Subscribe to remote audio (needed when using SUBSCRIBE_NONE).
     def _subscribe_audio(participant):
