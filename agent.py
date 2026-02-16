@@ -411,8 +411,11 @@ async def _run_session(ctx: JobContext):
     speak_first = _welcome_mode_from_room(ctx) != "user"
     enabled = _enabled_tools_from_room(ctx)
 
+    # Collect transcript for post-call extraction (call_analyzed webhook)
+    transcript_entries: list[dict] = []
+
     async def _post_end_call_to_server() -> None:
-        """POST to RapidCall API so it can hang up the SIP leg and send call_ended/call_analyzed webhooks."""
+        """POST to RapidCall API so it can hang up the SIP leg, run extraction, and send call_ended/call_analyzed webhooks."""
         call_id = _call_id_from_room(ctx)
         base_url = (os.environ.get("SERVER_BASE_URL") or "").strip().rstrip("/")
         secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
@@ -423,13 +426,16 @@ async def _run_session(ctx: JobContext):
         try:
             import requests
             body: dict = {"outcome": "agent_hangup"}
+            if transcript_entries:
+                body["transcript"] = transcript_entries
+                logger.info("End call: sending transcript with %d entries for call_analyzed", len(transcript_entries))
             resp = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: requests.post(
                     url,
                     json=body,
                     headers={"x-agent-secret": secret, "content-type": "application/json"},
-                    timeout=10,
+                    timeout=15,
                 ),
             )
             if resp.status_code >= 400:
@@ -463,6 +469,65 @@ async def _run_session(ctx: JobContext):
         min_interruption_duration=0.2,
         mcp_servers=_mcp_servers(),
     )
+
+    # Collect transcript for post-call extraction (call_analyzed webhook)
+    try:
+        from livekit.agents import ConversationItemAddedEvent
+
+        def _on_conversation_item_added(ev: ConversationItemAddedEvent) -> None:
+            item = getattr(ev, "item", None)
+            if not item:
+                return
+            role = getattr(item, "role", None)
+            text = (getattr(item, "text_content", None) or "").strip()
+            if not text:
+                return
+            r = "user" if role == "user" else "agent"
+            speaker = "User" if r == "user" else "Agent"
+            transcript_entries.append({"speaker": speaker, "role": r, "text": text[:5000]})
+
+        session.on("conversation_item_added", _on_conversation_item_added)
+    except Exception as e:
+        logger.debug("Could not register conversation_item_added for transcript: %s", e)
+
+    # Sync transcript to server periodically so when user hangs up we have it (transcript + analysis)
+    async def _sync_transcript_to_server() -> None:
+        if not transcript_entries:
+            return
+        call_id = _call_id_from_room(ctx)
+        base_url = (os.environ.get("SERVER_BASE_URL") or "").strip().rstrip("/")
+        secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
+        if not call_id or not base_url or not secret:
+            return
+        url = f"{base_url}/api/internal/calls/{call_id}/transcript"
+        try:
+            import requests
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.post(
+                    url,
+                    json={"transcript": list(transcript_entries)},
+                    headers={"x-agent-secret": secret, "content-type": "application/json"},
+                    timeout=5,
+                ),
+            )
+            if resp.status_code >= 400:
+                logger.debug("Transcript sync failed: %s %s", resp.status_code, resp.text[:100])
+        except Exception as e:
+            logger.debug("Transcript sync failed: %s", e)
+
+    _transcript_sync_task: asyncio.Task | None = None
+
+    async def _transcript_sync_loop() -> None:
+        while True:
+            await asyncio.sleep(10.0)
+            await _sync_transcript_to_server()
+
+    try:
+        _transcript_sync_task = asyncio.create_task(_transcript_sync_loop())
+        ctx.add_shutdown_callback(lambda: _transcript_sync_task.cancel() if _transcript_sync_task else None)
+    except Exception as e:
+        logger.debug("Could not start transcript sync task: %s", e)
 
     # Subscribe to remote audio (needed when using SUBSCRIBE_NONE).
     def _subscribe_audio(participant):
