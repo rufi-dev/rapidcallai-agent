@@ -82,8 +82,22 @@ def _mcp_servers():
         return []
 
 
+def _inbound_config_from_ctx(ctx: JobContext) -> dict | None:
+    """Inbound config from API response, stored in proc.userdata so session uses it instead of room metadata."""
+    proc = getattr(ctx, "proc", None)
+    ud = getattr(proc, "userdata", None) if proc else None
+    if not isinstance(ud, dict):
+        return None
+    return ud.get("inbound_config")
+
+
 def _call_id_from_room(ctx: JobContext) -> str | None:
-    """Read call id from room metadata (set by server when creating the room)."""
+    """Read call id from room metadata or from inbound_config (API response)."""
+    cfg = _inbound_config_from_ctx(ctx)
+    if cfg is not None:
+        cid = cfg.get("callId")
+        if isinstance(cid, str) and cid.strip():
+            return cid.strip()
     raw = getattr(ctx.room, "metadata", None)
     if not raw:
         return None
@@ -96,7 +110,12 @@ def _call_id_from_room(ctx: JobContext) -> str | None:
 
 
 def _instructions_from_room(ctx: JobContext) -> str | None:
-    """Read prompt from room metadata. LiveKit room metadata is set by your server."""
+    """Read prompt from inbound_config (API response) or room metadata."""
+    cfg = _inbound_config_from_ctx(ctx)
+    if cfg is not None:
+        prompt = cfg.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            return prompt.strip()
     raw = getattr(ctx.room, "metadata", None)
     if not raw:
         return None
@@ -109,7 +128,11 @@ def _instructions_from_room(ctx: JobContext) -> str | None:
 
 
 def _welcome_mode_from_room(ctx: JobContext) -> str:
-    """Read welcome.mode from room metadata: 'user' = user speaks first, else AI speaks first."""
+    """Read welcome.mode from inbound_config or room metadata."""
+    cfg = _inbound_config_from_ctx(ctx)
+    if cfg is not None:
+        w = cfg.get("welcome") or {}
+        return "user" if w.get("mode") == "user" else "ai"
     raw = getattr(ctx.room, "metadata", None)
     if not raw:
         return "ai"
@@ -122,7 +145,11 @@ def _welcome_mode_from_room(ctx: JobContext) -> str:
 
 
 def _voice_from_room(ctx: JobContext) -> dict:
-    """Read agent.voice from room metadata so dashboard voice selection is used."""
+    """Read agent.voice from inbound_config or room metadata so dashboard voice selection is used."""
+    cfg = _inbound_config_from_ctx(ctx)
+    if cfg is not None:
+        v = cfg.get("voice")
+        return v if isinstance(v, dict) else {}
     raw = getattr(ctx.room, "metadata", None)
     if not raw:
         return {}
@@ -135,7 +162,13 @@ def _voice_from_room(ctx: JobContext) -> dict:
 
 
 def _enabled_tools_from_room(ctx: JobContext) -> list[str]:
-    """Read agent.enabledTools from room metadata (dashboard Tools tab). Default: end_call only."""
+    """Read agent.enabledTools from inbound_config or room metadata (dashboard Tools tab)."""
+    cfg = _inbound_config_from_ctx(ctx)
+    if cfg is not None:
+        t = cfg.get("enabledTools")
+        if isinstance(t, list):
+            return [str(x).strip() for x in t if isinstance(x, str) and x.strip()]
+        return ["end_call"]
     raw = getattr(ctx.room, "metadata", None)
     if not raw:
         return ["end_call"]
@@ -150,7 +183,10 @@ def _enabled_tools_from_room(ctx: JobContext) -> list[str]:
 
 
 def _backchannel_enabled_from_room(ctx: JobContext) -> bool:
-    """Read agent.backchannelEnabled from room metadata (dashboard Speech settings)."""
+    """Read agent.backchannelEnabled from inbound_config or room metadata."""
+    cfg = _inbound_config_from_ctx(ctx)
+    if cfg is not None:
+        return bool(cfg.get("backchannelEnabled"))
     raw = getattr(ctx.room, "metadata", None)
     if not raw:
         return False
@@ -213,7 +249,11 @@ def _positive_float(val, default: float) -> float:
 
 
 def _call_settings_from_room(ctx: JobContext) -> dict:
-    """Read agent.callSettings from room metadata (voicemail detection, response, message)."""
+    """Read agent.callSettings from inbound_config or room metadata."""
+    cfg = _inbound_config_from_ctx(ctx)
+    if cfg is not None:
+        cs = cfg.get("callSettings")
+        return cs if isinstance(cs, dict) else {}
     raw = getattr(ctx.room, "metadata", None)
     if not raw:
         return {}
@@ -304,10 +344,12 @@ class VoiceAgent(Agent):
         instructions: str,
         speak_first: bool = True,
         tools: list | None = None,
+        inbound_config: dict | None = None,
     ) -> None:
         tools = tools or [EndCallTool()]
         super().__init__(instructions=instructions, tools=tools)
         self._speak_first = speak_first
+        self._inbound_config = inbound_config
 
     async def on_enter(self):
         if not self._speak_first:
@@ -344,7 +386,13 @@ class VoiceAgent(Agent):
             yield FlushSentinel()
 
     def _room_metadata(self, context: RunContext) -> dict:
-        """Read room metadata (call.to, agent.toolConfigs, etc.) for use in tools."""
+        """Read room metadata (call.to, agent.toolConfigs, etc.) for use in tools. Uses inbound_config when set."""
+        cfg = getattr(self, "_inbound_config", None)
+        if isinstance(cfg, dict):
+            return {
+                "call": {"id": cfg.get("callId"), "to": "unknown"},
+                "agent": {"toolConfigs": cfg.get("toolConfigs") or {}},
+            }
         raw = getattr(getattr(context, "room", None), "metadata", None) or ""
         try:
             return json.loads(raw) if raw else {}
@@ -471,56 +519,46 @@ def _room_has_agent_config(ctx: JobContext) -> bool:
 def _get_inbound_to_from(ctx: JobContext) -> tuple[str | None, str | None]:
     """
     Try to get (to, from) for inbound/start from room name or participants.
-    to = trunk number that was dialed, from = caller. Returns (None, None) if we can't get both.
+    to = trunk number that was dialed, from = caller. With one number we use it as 'to' so we always call the API.
     """
     import re
     room_name = getattr(ctx.room, "name", None) or ""
-    # E.164-like: + followed by 10-15 digits
     parts = re.findall(r"\+\d{10,15}", room_name)
     if len(parts) >= 2:
         return (parts[0], parts[1])
     if len(parts) == 1:
-        # One number only - could be caller (from). Try to get 'to' from first remote participant metadata.
-        from_num = parts[0]
-        for p in getattr(ctx.room, "remote_participants", {}).values():
-            identity = (getattr(p, "identity", None) or "") or ""
-            meta = getattr(p, "metadata", None) or ""
-            # Some SIP setups put trunk number in identity or metadata
-            for raw in (identity, meta):
-                m = re.search(r"\+\d{10,15}", raw)
-                if m and m.group(0) != from_num:
-                    return (m.group(0), from_num)
-        return (None, from_num)
+        # Single number: use as 'to' (trunk that was dialed) so we always call inbound/start and get agent config.
+        return (parts[0], "")
     for p in getattr(ctx.room, "remote_participants", {}).values():
         identity = (getattr(p, "identity", None) or "") or ""
         found = re.findall(r"\+\d{10,15}", identity)
         if len(found) >= 2:
             return (found[0], found[1])
         if len(found) == 1:
-            return (found[0], found[0])  # use same as both when only one available (best effort)
+            return (found[0], "")
     return (None, None)
 
 
-async def _ensure_inbound_config(ctx: JobContext) -> None:
+async def _ensure_inbound_config(ctx: JobContext) -> dict | None:
     """
     For inbound telephony: if room has no agent config, call the server's inbound/start
-    so it creates the call record and updates room metadata (prompt, voice, tools).
-    Requires SERVER_BASE_URL and AGENT_SHARED_SECRET. to/from are derived from room name or participants.
+    and return the response so we use it directly (no reliance on room metadata propagation).
+    Returns the JSON response dict on success, None otherwise.
     """
     if _room_has_agent_config(ctx):
-        return
+        return None
     base_url = (os.environ.get("SERVER_BASE_URL") or os.environ.get("PUBLIC_API_BASE_URL") or "").strip().rstrip("/")
     secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
     if not base_url or not secret:
         logger.debug("Inbound config: skip (no SERVER_BASE_URL or AGENT_SHARED_SECRET)")
-        return
+        return None
     to, from_ = _get_inbound_to_from(ctx)
     if not to:
         logger.debug("Inbound config: skip (could not get 'to' from room name or participants)")
-        return
+        return None
     room_name = getattr(ctx.room, "name", None) or ""
     if not room_name:
-        return
+        return None
     url = f"{base_url}/api/internal/telephony/inbound/start"
     try:
         import requests
@@ -535,17 +573,24 @@ async def _ensure_inbound_config(ctx: JobContext) -> None:
             ),
         )
         if resp.status_code in (200, 201):
-            logger.info("Inbound config: fetched and room metadata updated for %s", room_name)
-            # Give LiveKit a moment to push metadata to this participant
-            await asyncio.sleep(0.3)
-        else:
-            logger.warning("Inbound config: POST %s returned %s %s", url, resp.status_code, (resp.text or "")[:200])
+            data = resp.json() if resp.text else {}
+            logger.info("Inbound config: got agent config for %s (using response directly)", room_name)
+            return data
+        logger.warning("Inbound config: POST %s returned %s %s", url, resp.status_code, (resp.text or "")[:200])
+        return None
     except Exception as e:
         logger.warning("Inbound config: failed to call inbound/start: %s", e)
+        return None
 
 
-async def _run_session(ctx: JobContext):
+async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
     ctx.log_context_fields = {"room": ctx.room.name}
+
+    # So all _*_from_room helpers and tools use API response instead of room metadata (no propagation delay).
+    if inbound_config is not None:
+        ud = getattr(ctx.proc, "userdata", None)
+        if isinstance(ud, dict):
+            ud["inbound_config"] = inbound_config
 
     # Connect with SUBSCRIBE_NONE so session manages audio (avoids agent not hearing user on web).
     await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_NONE)
@@ -1009,7 +1054,12 @@ async def _run_session(ctx: JobContext):
             except Exception as e:
                 logger.warning("Background audio setup failed: %s", e)
 
-    agent = VoiceAgent(instructions=instructions, speak_first=speak_first, tools=tool_list)
+    agent = VoiceAgent(
+        instructions=instructions,
+        speak_first=speak_first,
+        tools=tool_list,
+        inbound_config=inbound_config,
+    )
     agent.transcript_entries = transcript_entries
     await session.start(
         agent=agent,
@@ -1025,13 +1075,13 @@ async def _run_session(ctx: JobContext):
 if LIVEKIT_AGENT_NAME:
     @server.rtc_session(agent_name=LIVEKIT_AGENT_NAME)
     async def entrypoint(ctx: JobContext):
-        await _ensure_inbound_config(ctx)
-        await _run_session(ctx)
+        inbound_config = await _ensure_inbound_config(ctx)
+        await _run_session(ctx, inbound_config=inbound_config)
 else:
     @server.rtc_session()
     async def entrypoint(ctx: JobContext):
-        await _ensure_inbound_config(ctx)
-        await _run_session(ctx)
+        inbound_config = await _ensure_inbound_config(ctx)
+        await _run_session(ctx, inbound_config=inbound_config)
 
 
 if __name__ == "__main__":
