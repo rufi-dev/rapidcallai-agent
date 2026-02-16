@@ -479,6 +479,7 @@ async def _run_session(ctx: JobContext):
         "END CALL: You have an end_call tool. When the user says goodbye, wants to hang up, or "
         "is done with the conversation, call end_call. Say a brief goodbye first, then call the tool."
     )
+    enabled = _enabled_tools_from_room(ctx)
     backchannel_rule = ""
     if _backchannel_enabled_from_room(ctx):
         backchannel_rule = (
@@ -511,7 +512,6 @@ async def _run_session(ctx: JobContext):
         )
     instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}{transfer_call_rule}{backchannel_rule}{voicemail_rule}"
     speak_first = _welcome_mode_from_room(ctx) != "user"
-    enabled = _enabled_tools_from_room(ctx)
 
     # Collect transcript for post-call extraction (call_analyzed webhook)
     transcript_entries: list[dict] = []
