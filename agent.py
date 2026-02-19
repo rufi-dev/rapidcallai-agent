@@ -759,6 +759,12 @@ class VoiceAgent(Agent):
                 "Get the API key from Cal.com Settings → Security; Event Type ID is in your Cal.com booking URL."
             )
             fetch_debug = getattr(self, "_last_agent_config_fetch_debug", None) or {}
+            skip_reason = fetch_debug.get("skipReason") or "unknown"
+            logger.info(
+                "[check_availability_cal] not_configured on phone call: toolConfigKeysReceived=%s configFetchSkipReason=%s (fix: ensure inbound/start returns config; set SERVER_BASE_URL and AGENT_SHARED_SECRET on agent)",
+                config_keys_received,
+                skip_reason,
+            )
             result = {
                 "status": "not_configured",
                 "message": msg,

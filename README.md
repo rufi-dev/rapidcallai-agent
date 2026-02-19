@@ -54,3 +54,20 @@ Set `LIVEKIT_AGENT_NAME` in `.env` if you use agent dispatch.
 - **No speech:** Set `CARTESIA_API_KEY` (agent uses Cartesia TTS by default).
 - **Agent not hearing user (web):** The agent uses `SUBSCRIBE_NONE` and subscribes to remote audio after connect; if you change the entrypoint, keep that behavior.
 - **Robotic sound on your site:** Use a single `RoomAudioRenderer` and the “Start audio” unlock (browser autoplay). See client Talk UI.
+
+### Why calendar/slots don't work on phone calls (logs)
+
+When the user asks for available dates/slots on a **phone** call and gets "I can't check the calendar", the agent didn't receive tool config. Use these log searches:
+
+**Agent logs** — search for:
+- `[check_availability_cal] not_configured on phone call` — shows `toolConfigKeysReceived=` and `configFetchSkipReason=` (why config was missing).
+- `Inbound config: got agent config for` — inbound/start succeeded; if you never see this on phone, inbound config is failing.
+- `Inbound config: could not get 'to' from` — agent couldn't get dialed number; see `(tried E.164s: ...)`.
+- `Inbound config: SIP participant attributes for room` — shows what LiveKit sent (e.g. sip.trunkPhoneNumber).
+- `Inbound config: skip (no SERVER_BASE_URL or AGENT_SHARED_SECRET)` — set both env vars on the agent.
+
+**Server logs** — search for:
+- `[internal.telephony.inbound.start] request received` — agent called inbound/start (if missing, agent isn't calling API).
+- `[internal.telephony.inbound.start]` with roomName, to, from — request params.
+- `[internal.telephony.inbound.start] room metadata updated` — server set room metadata.
+- `[internal.telephony.inbound.start] phone number not found` — the "to" sent isn't in your DB.
