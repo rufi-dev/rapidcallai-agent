@@ -411,8 +411,44 @@ class VoiceAgent(Agent):
             tool_configs = data.get("toolConfigs")
         if not isinstance(tool_configs, dict):
             tool_configs = {}
+        # Use server-fetched config when room metadata had none (fallback for missing toolConfigs in room)
+        fetched = getattr(self, "_fetched_agent_config", None)
+        if not tool_configs and isinstance(fetched, dict) and isinstance(fetched.get("toolConfigs"), dict):
+            tool_configs = fetched.get("toolConfigs")
         agent = {**agent, "toolConfigs": tool_configs}
         return {"call": data.get("call") or {}, "agent": agent}
+
+    async def _fetch_agent_config_if_needed(self, context: RunContext) -> None:
+        """When room metadata has empty toolConfigs but has agent id and workspaceId, fetch from server and cache."""
+        if getattr(self, "_inbound_config", None) is not None:
+            return
+        meta = self._room_metadata(context)
+        agent_node = meta.get("agent") or {}
+        tool_configs = agent_node.get("toolConfigs") or {}
+        if isinstance(tool_configs, dict) and len(tool_configs) > 0:
+            return
+        agent_id = (agent_node.get("id") or "").strip()
+        workspace_id = (agent_node.get("workspaceId") or "").strip()
+        if not agent_id or not workspace_id:
+            return
+        base_url = (os.environ.get("SERVER_BASE_URL") or os.environ.get("PUBLIC_API_BASE_URL") or "").strip().rstrip("/")
+        secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
+        if not base_url or not secret:
+            return
+        url = f"{base_url}/api/internal/agents/config?workspaceId={workspace_id}&agentId={agent_id}"
+        try:
+            import requests
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.get(url, headers={"x-agent-secret": secret}, timeout=8),
+            )
+            if resp.status_code == 200 and resp.text:
+                data = resp.json()
+                if isinstance(data.get("toolConfigs"), dict):
+                    setattr(self, "_fetched_agent_config", data)
+                    logger.info("[agent_config] fetched toolConfigs from server (room metadata had none), keys=%s", list(data.get("toolConfigs", {}).keys()))
+        except Exception as e:
+            logger.warning("[agent_config] failed to fetch config from server: %s", e)
 
     @function_tool
     async def lookup_weather(
@@ -576,6 +612,7 @@ class VoiceAgent(Agent):
         end_date: str = "",
     ) -> str:
         """Check calendar availability. Use when the user asks for available times, slots, or when they can book. By default use from today through one month from today: leave start_date and end_date empty or omit them. Only pass start_date and end_date (YYYY-MM-DD) if the user asks for a specific range. Returns a list of available slot times the user can choose from."""
+        await self._fetch_agent_config_if_needed(context)
         cfg = self._cal_com_config(context, "check_availability_cal")
         timezone = (cfg.get("timezone") or "UTC").strip() or "UTC"
         start_date = (start_date or "").strip()
@@ -707,6 +744,7 @@ class VoiceAgent(Agent):
         attendee_email: str,
     ) -> str:
         """Book an appointment on the calendar. Use after the user has chosen a time from the available slots. start must be the exact ISO 8601 time in UTC (e.g. 2024-08-13T14:00:00Z). attendee_name and attendee_email are the name and email of the person booking."""
+        await self._fetch_agent_config_if_needed(context)
         entries = getattr(self, "transcript_entries", None)
         tid = uuid.uuid4().hex[:16]
         inp = {"start": start, "attendee_name": attendee_name, "attendee_email": attendee_email}
