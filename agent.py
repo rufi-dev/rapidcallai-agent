@@ -439,6 +439,8 @@ class VoiceAgent(Agent):
         if not agent_id:
             room = getattr(context, "room", None)
             room_name = (getattr(room, "name", None) or "").strip()
+            if not room_name:
+                room_name = (getattr(self, "_room_name", None) or "").strip()
             if room_name and "-" in room_name:
                 parts = room_name.split("-", 2)
                 if len(parts) >= 2 and parts[0].lower() == "call":
@@ -1580,6 +1582,8 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
         inbound_config=inbound_config,
     )
     agent.transcript_entries = transcript_entries
+    # Store room name so tools can parse agentId when RunContext has no room (e.g. webtest)
+    agent._room_name = getattr(ctx.room, "name", None) or ""
     await session.start(
         agent=agent,
         room=ctx.room,
