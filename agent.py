@@ -663,21 +663,40 @@ class VoiceAgent(Agent):
 
     def _slot_to_utc_iso(self, start: str, fallback_timezone: str = "UTC") -> str:
         """Convert a slot string from check_availability_cal to UTC ISO for Cal.com v2 booking. Accepts e.g. 2026-02-20T09:00:00-08:00 or 2026-02-20T09:00:00Z."""
+        import re
         start = (start or "").strip()
         if not start:
             return start
+        if start.upper().endswith("Z"):
+            return start if start.endswith("Z") else start[:-1] + "Z"
+        # Parse ISO with offset (e.g. 2026-02-20T09:00:00-08:00 or +01:00) - manual parse for cross-version reliability
+        m = re.match(
+            r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})([+-])(\d{2}):(\d{2})$",
+            start,
+        )
+        if m:
+            try:
+                y, mo, d, h, mi, s = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), int(m.group(6))
+                sign = 1 if m.group(7) == "+" else -1
+                oh, om = int(m.group(8)), int(m.group(9))
+                offset_minutes = sign * (oh * 60 + om)  # e.g. -08:00 -> -480
+                from datetime import timezone
+                local_naive = datetime(y, mo, d, h, mi, s)
+                # timezone with offset_minutes behind UTC (e.g. -480 = UTC-8)
+                utc_dt = local_naive.replace(tzinfo=timezone(timedelta(minutes=offset_minutes))).astimezone(timezone.utc)
+                return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception as e:
+                logger.warning("[_slot_to_utc_iso] manual parse failed: %s", e)
         try:
             from zoneinfo import ZoneInfo
-            if start.upper().endswith("Z"):
-                return start if start.endswith("Z") else start[:-1] + "Z"
-            # Parse ISO with offset (e.g. 2026-02-20T09:00:00-08:00)
             dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
             if dt.tzinfo is None:
                 tz = ZoneInfo(fallback_timezone)
                 dt = dt.replace(tzinfo=tz)
             utc_dt = dt.astimezone(datetime.timezone.utc)
             return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        except Exception:
+        except Exception as e:
+            logger.warning("[_slot_to_utc_iso] fromisoformat failed: %s", e)
             return start
 
     def _today_and_month_ahead(self, timezone_str: str) -> tuple[str, str]:
@@ -950,6 +969,13 @@ class VoiceAgent(Agent):
             msg = err_obj.get("message") or err.get("message") or resp.text or f"Cal.com returned {resp.status_code}"
             if isinstance(msg, dict):
                 msg = msg.get("message") or msg.get("code") or str(msg)
+            # 5xx = service outage; tell the agent to suggest retry, not "slot taken"
+            if resp.status_code >= 500:
+                user_message = (
+                    "The calendar service is temporarily unavailable. Please ask the customer to try again in a moment or book later."
+                )
+            else:
+                user_message = f"Booking failed: {msg}. Ask the customer to try another time or contact support."
             result = {
                 "status": "failed",
                 "message": msg,
@@ -962,7 +988,7 @@ class VoiceAgent(Agent):
             }
             if entries is not None:
                 entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "book_appointment_cal", "result": result})
-            return f"Booking failed: {msg}. Ask the customer to try another time or contact support."
+            return user_message
         except Exception as e:
             logger.exception("[book_appointment_cal] failed: %s", e)
             msg = str(e)
