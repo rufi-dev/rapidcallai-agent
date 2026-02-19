@@ -391,15 +391,28 @@ class VoiceAgent(Agent):
         """Read room metadata (call.to, agent.toolConfigs, etc.) for use in tools. Uses inbound_config when set."""
         cfg = getattr(self, "_inbound_config", None)
         if isinstance(cfg, dict):
+            tool_configs = cfg.get("toolConfigs")
+            if not isinstance(tool_configs, dict):
+                tool_configs = {}
             return {
-                "call": {"id": cfg.get("callId"), "to": "unknown"},
-                "agent": {"toolConfigs": cfg.get("toolConfigs") or {}},
+                "call": {"id": cfg.get("callId"), "to": cfg.get("agent", {}).get("to") or "unknown"},
+                "agent": {"toolConfigs": tool_configs},
             }
-        raw = getattr(getattr(context, "room", None), "metadata", None) or ""
+        room = getattr(context, "room", None)
+        raw = getattr(room, "metadata", None) or ""
         try:
-            return json.loads(raw) if raw else {}
+            data = json.loads(raw) if raw else {}
         except Exception:
-            return {}
+            data = {}
+        # Support both shapes: agent.toolConfigs (room metadata) and top-level toolConfigs (API response shape)
+        agent = data.get("agent") or {}
+        tool_configs = agent.get("toolConfigs") if isinstance(agent.get("toolConfigs"), dict) else None
+        if not isinstance(tool_configs, dict) and isinstance(data.get("toolConfigs"), dict):
+            tool_configs = data.get("toolConfigs")
+        if not isinstance(tool_configs, dict):
+            tool_configs = {}
+        agent = {**agent, "toolConfigs": tool_configs}
+        return {"call": data.get("call") or {}, "agent": agent}
 
     @function_tool
     async def lookup_weather(
@@ -516,8 +529,24 @@ class VoiceAgent(Agent):
     def _cal_com_config(self, context: RunContext, tool_id: str) -> dict:
         """Get Cal.com config (apiKey, eventTypeId, timezone) from toolConfigs for check_availability_cal or book_appointment_cal."""
         meta = self._room_metadata(context)
-        cfg = (meta.get("agent") or {}).get("toolConfigs") or {}
-        return cfg.get(tool_id) or {}
+        all_configs = (meta.get("agent") or {}).get("toolConfigs") or {}
+        if not isinstance(all_configs, dict):
+            all_configs = {}
+        cfg = all_configs.get(tool_id) or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        has_key = bool((cfg.get("apiKey") or "").strip())
+        has_event = bool((cfg.get("eventTypeId") or "").strip())
+        if not has_key or not has_event:
+            logger.info(
+                "[cal_com] %s: apiKey=%s eventTypeId=%s (source=%s). Set API Key and Event Type ID in dashboard: Agent → Functions → %s → Save.",
+                tool_id,
+                "set" if has_key else "missing",
+                "set" if has_event else "missing",
+                "inbound_config" if getattr(self, "_inbound_config", None) else "room_metadata",
+                "Check Calendar Availability" if tool_id == "check_availability_cal" else "Book on the Calendar",
+            )
+        return cfg
 
     def _today_and_month_ahead(self, timezone_str: str) -> tuple[str, str]:
         """Return (start_date, end_date) as YYYY-MM-DD: today and one month from today in the given timezone."""
@@ -563,7 +592,11 @@ class VoiceAgent(Agent):
         event_type_id = (cfg.get("eventTypeId") or "").strip()
 
         if not api_key or not event_type_id:
-            msg = "Calendar availability is not configured. Please set API key and Event Type ID in the dashboard."
+            msg = (
+                "Calendar availability is not configured. In the dashboard go to Agent → Functions → enable "
+                "'Check Calendar Availability (Cal.com)' → click the pencil → enter your Cal.com API Key and Event Type ID → Save. "
+                "Get the API key from Cal.com Settings → Security; Event Type ID is in your Cal.com booking URL."
+            )
             result = {"status": "not_configured", "message": msg}
             if entries is not None:
                 entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "check_availability_cal", "result": result})
@@ -644,7 +677,10 @@ class VoiceAgent(Agent):
         timezone = (cfg.get("timezone") or "UTC").strip() or "UTC"
 
         if not api_key or not event_type_id_raw:
-            msg = "Calendar booking is not configured. Please set API key and Event Type ID in the dashboard."
+            msg = (
+                "Calendar booking is not configured. In the dashboard go to Agent → Functions → enable "
+                "'Book on the Calendar (Cal.com)' → click the pencil → enter your Cal.com API Key and Event Type ID → Save."
+            )
             result = {"status": "not_configured", "message": msg}
             if entries is not None:
                 entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "book_appointment_cal", "result": result})
