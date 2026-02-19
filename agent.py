@@ -661,6 +661,25 @@ class VoiceAgent(Agent):
             )
         return cfg
 
+    def _slot_to_utc_iso(self, start: str, fallback_timezone: str = "UTC") -> str:
+        """Convert a slot string from check_availability_cal to UTC ISO for Cal.com v2 booking. Accepts e.g. 2026-02-20T09:00:00-08:00 or 2026-02-20T09:00:00Z."""
+        start = (start or "").strip()
+        if not start:
+            return start
+        try:
+            from zoneinfo import ZoneInfo
+            if start.upper().endswith("Z"):
+                return start if start.endswith("Z") else start[:-1] + "Z"
+            # Parse ISO with offset (e.g. 2026-02-20T09:00:00-08:00)
+            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                tz = ZoneInfo(fallback_timezone)
+                dt = dt.replace(tzinfo=tz)
+            utc_dt = dt.astimezone(datetime.timezone.utc)
+            return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            return start
+
     def _today_and_month_ahead(self, timezone_str: str) -> tuple[str, str]:
         """Return (start_date, end_date) as YYYY-MM-DD: today and one month from today in the given timezone."""
         try:
@@ -827,13 +846,22 @@ class VoiceAgent(Agent):
         attendee_name: str,
         attendee_email: str,
     ) -> str:
-        """Book an appointment on the calendar. Use after the user has chosen a time from the available slots. start must be the exact ISO 8601 time in UTC (e.g. 2024-08-13T14:00:00Z). attendee_name and attendee_email are the name and email of the person booking."""
+        """Book an appointment on the calendar. Use after the user has chosen a time. start must be one of the exact slot strings returned by check_availability_cal (e.g. 2026-02-20T09:00:00-08:00) — do not convert to UTC yourself. attendee_name is the attendee's name. attendee_email must be a valid full email address (e.g. name@domain.com); if you do not have it, ask the user before calling."""
         await self._fetch_agent_config_if_needed(context)
         entries = getattr(self, "transcript_entries", None)
         tid = uuid.uuid4().hex[:16]
         inp = {"start": start, "attendee_name": attendee_name, "attendee_email": attendee_email}
         if entries is not None:
             entries.append({"kind": "tool_invocation", "toolCallId": tid, "toolName": "book_appointment_cal", "input": inp})
+
+        # Require valid email so Cal.com does not return email_validation_error
+        attendee_email = (attendee_email or "").strip()
+        if not attendee_email or "@" not in attendee_email or "." not in attendee_email.split("@")[-1]:
+            msg = "A valid full email address is required (e.g. name@company.com). Please ask the user for their email before booking."
+            result = {"status": "invalid_email", "message": msg, "callHistoryDebug": {"hint": "attendee_email must contain @ and a domain."}}
+            if entries is not None:
+                entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "book_appointment_cal", "result": result})
+            return msg
 
         cfg = self._cal_com_config(context, "book_appointment_cal")
         api_key = (cfg.get("apiKey") or "").strip()
@@ -877,10 +905,8 @@ class VoiceAgent(Agent):
                 entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "book_appointment_cal", "result": result})
             return msg
 
-        # Cal.com v2: start must be UTC ISO 8601
-        if not start.endswith("Z") and "+" not in start and "-" not in start[-6:]:
-            start = start.replace(" ", "T") if "T" not in start else start
-            start = f"{start}Z" if start[-1] != "Z" else start
+        # Convert slot from check_availability_cal (e.g. 2026-02-20T09:00:00-08:00) to UTC for Cal.com v2
+        start_utc = self._slot_to_utc_iso((start or "").strip(), timezone)
 
         try:
             import requests
@@ -892,7 +918,7 @@ class VoiceAgent(Agent):
             }
             body = {
                 "eventTypeId": event_type_id,
-                "start": start,
+                "start": start_utc,
                 "attendee": {
                     "name": attendee_name.strip(),
                     "email": attendee_email.strip(),
@@ -919,14 +945,19 @@ class VoiceAgent(Agent):
                 if entries is not None:
                     entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "book_appointment_cal", "result": result})
                 return "The appointment has been booked successfully. Confirm the date and time to the customer and mention they will receive a calendar invite by email."
-            msg = err.get("message") or err.get("error") or resp.text or f"Cal.com returned {resp.status_code}"
+            # Cal.com v2 returns { "status": "error", "error": { "message": "...", "code": "..." } }
+            err_obj = err.get("error") if isinstance(err.get("error"), dict) else {}
+            msg = err_obj.get("message") or err.get("message") or resp.text or f"Cal.com returned {resp.status_code}"
+            if isinstance(msg, dict):
+                msg = msg.get("message") or msg.get("code") or str(msg)
             result = {
                 "status": "failed",
                 "message": msg,
                 "callHistoryDebug": {
                     "calComStatusCode": resp.status_code,
                     "calComResponseBody": resp_body_snippet,
-                    "hint": "Check API key, Event Type ID, start time (UTC ISO), and attendee email.",
+                    "startUtcSent": start_utc,
+                    "hint": "Use exact slot string from check_availability_cal; ensure attendee email is valid.",
                 },
             }
             if entries is not None:
@@ -1120,9 +1151,9 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
     cal_book_rule = ""
     if "book_appointment_cal" in enabled:
         cal_book_rule = (
-            "\n\nBOOK CALENDAR: You have book_appointment_cal. Use it to book an appointment after the user has "
-            "chosen a time. Pass the exact start time in UTC ISO format (e.g. 2024-08-13T14:00:00Z), and the "
-            "attendee's name and email. Confirm the booking to the customer after it succeeds."
+            "\n\nBOOK CALENDAR: You have book_appointment_cal. Use it to book after the user has chosen a time. "
+            "Pass start as one of the exact slot strings returned by check_availability_cal (e.g. 2026-02-20T09:00:00-08:00); do not convert to UTC. "
+            "Pass the attendee's name and a valid full email (e.g. name@domain.com). If you do not have the email, ask the user first. Confirm the booking to the customer after it succeeds."
         )
     instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}{transfer_call_rule}{cal_availability_rule}{cal_book_rule}{backchannel_rule}{voicemail_rule}"
     speak_first = _welcome_mode_from_room(ctx) != "user"
