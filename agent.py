@@ -394,9 +394,14 @@ class VoiceAgent(Agent):
             tool_configs = cfg.get("toolConfigs")
             if not isinstance(tool_configs, dict):
                 tool_configs = {}
+            agent_node = cfg.get("agent") or {}
             return {
-                "call": {"id": cfg.get("callId"), "to": cfg.get("agent", {}).get("to") or "unknown"},
-                "agent": {"toolConfigs": tool_configs},
+                "call": {"id": cfg.get("callId"), "to": agent_node.get("to") or "unknown"},
+                "agent": {
+                    "id": (agent_node.get("id") or "").strip(),
+                    "workspaceId": (agent_node.get("workspaceId") or cfg.get("workspaceId") or "").strip(),
+                    "toolConfigs": tool_configs,
+                },
             }
         room = getattr(context, "room", None)
         raw = getattr(room, "metadata", None) or ""
@@ -1033,6 +1038,7 @@ def _get_inbound_to_from(ctx: JobContext) -> tuple[str | None, str | None]:
     - sip.phoneNumber = caller (from)
     Fallback: parse room name (works if using Callee dispatch rule where room name contains the called number).
     """
+    import re
     # 1) From SIP participant attributes (recommended by LiveKit docs) — works for Individual and Callee rules.
     try:
         kind_sip = getattr(rtc.ParticipantKind, "PARTICIPANT_KIND_SIP", None)
@@ -1040,14 +1046,13 @@ def _get_inbound_to_from(ctx: JobContext) -> tuple[str | None, str | None]:
             if getattr(p, "kind", None) != kind_sip:
                 continue
             attrs = getattr(p, "attributes", None) or {}
-            to_num = (attrs.get("sip.trunkPhoneNumber") or "").strip()
-            from_num = (attrs.get("sip.phoneNumber") or "").strip()
+            to_num = (attrs.get("sip.trunkPhoneNumber") or attrs.get("trunkPhoneNumber") or "").strip()
+            from_num = (attrs.get("sip.phoneNumber") or attrs.get("phoneNumber") or "").strip()
             if to_num:
                 return (to_num, from_num)
     except Exception as e:
         logger.debug("Reading SIP attributes: %s", e)
     # 2) Room name: with Callee rule room can be "number-+15551234567" or "call-+15551234567-abc"; with Individual it's caller number.
-    import re
     room_name = getattr(ctx.room, "name", None) or ""
     parts = re.findall(r"\+\d{10,15}", room_name)
     if len(parts) >= 2:
@@ -1063,6 +1068,7 @@ async def _ensure_inbound_config(ctx: JobContext) -> dict | None:
     For inbound telephony: if room has no agent config, call the server's inbound/start
     and return the response so we use it directly (no reliance on room metadata propagation).
     Returns the JSON response dict on success, None otherwise.
+    Retries getting (to, from) a few times so SIP participant attributes are available.
     """
     if _room_has_agent_config(ctx):
         return None
@@ -1071,12 +1077,23 @@ async def _ensure_inbound_config(ctx: JobContext) -> dict | None:
     if not base_url or not secret:
         logger.debug("Inbound config: skip (no SERVER_BASE_URL or AGENT_SHARED_SECRET)")
         return None
-    to, from_ = _get_inbound_to_from(ctx)
-    if not to:
-        logger.debug("Inbound config: skip (could not get 'to' from room name or participants)")
-        return None
     room_name = getattr(ctx.room, "name", None) or ""
     if not room_name:
+        return None
+    # Retry getting (to, from): SIP participant may join shortly after we connect.
+    to, from_ = None, None
+    for attempt in range(4):
+        to, from_ = _get_inbound_to_from(ctx)
+        if to:
+            break
+        if attempt < 3:
+            await asyncio.sleep(0.5 + attempt * 0.5)
+    if not to:
+        logger.warning(
+            "Inbound config: could not get 'to' (dialed number) from SIP attributes or room name=%s. "
+            "Ensure LiveKit SIP participant has sip.trunkPhoneNumber / sip.phoneNumber attributes or room name contains E.164.",
+            room_name[:80],
+        )
         return None
     url = f"{base_url}/api/internal/telephony/inbound/start"
     try:
