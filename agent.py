@@ -512,6 +512,174 @@ class VoiceAgent(Agent):
                 entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "transfer_call", "result": result})
             return f"Transfer failed. Please inform the customer that the transfer did not go through and offer to try again or assist them directly."
 
+    def _cal_com_config(self, context: RunContext, tool_id: str) -> dict:
+        """Get Cal.com config (apiKey, eventTypeId, timezone) from toolConfigs for check_availability_cal or book_appointment_cal."""
+        meta = self._room_metadata(context)
+        cfg = (meta.get("agent") or {}).get("toolConfigs") or {}
+        return cfg.get(tool_id) or {}
+
+    @function_tool
+    async def check_availability_cal(
+        self,
+        context: RunContext,
+        start_date: str,
+        end_date: str,
+    ) -> str:
+        """Check calendar availability for the given date range. Use when the user asks for available times, slots, or when they can book. start_date and end_date must be in YYYY-MM-DD format (e.g. 2024-08-13). Returns a list of available slot times the user can choose from."""
+        entries = getattr(self, "transcript_entries", None)
+        tid = uuid.uuid4().hex[:16]
+        inp = {"start_date": start_date, "end_date": end_date}
+        if entries is not None:
+            entries.append({"kind": "tool_invocation", "toolCallId": tid, "toolName": "check_availability_cal", "input": inp})
+
+        cfg = self._cal_com_config(context, "check_availability_cal")
+        api_key = (cfg.get("apiKey") or "").strip()
+        event_type_id = (cfg.get("eventTypeId") or "").strip()
+        timezone = (cfg.get("timezone") or "UTC").strip() or "UTC"
+
+        if not api_key or not event_type_id:
+            msg = "Calendar availability is not configured. Please set API key and Event Type ID in the dashboard."
+            result = {"status": "not_configured", "message": msg}
+            if entries is not None:
+                entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "check_availability_cal", "result": result})
+            return msg
+
+        try:
+            import requests
+            # Cal.com v1 slots API: GET https://api.cal.com/v1/slots
+            start_time = f"{start_date}T00:00:00"
+            end_time = f"{end_date}T23:59:59"
+            url = "https://api.cal.com/v1/slots"
+            params = {
+                "apiKey": api_key,
+                "eventTypeId": event_type_id,
+                "startTime": start_time,
+                "endTime": end_time,
+                "timeZone": timezone,
+            }
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.get(url, params=params, timeout=15),
+            )
+            if resp.status_code != 200:
+                err = resp.json() if resp.text else {}
+                msg = err.get("message") or resp.text or f"Cal.com returned {resp.status_code}"
+                result = {"status": "error", "message": msg}
+                if entries is not None:
+                    entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "check_availability_cal", "result": result})
+                return f"Could not fetch availability: {msg}"
+
+            data = resp.json()
+            slots_by_date = data.get("slots") or {}
+            flat = []
+            for day, times in slots_by_date.items():
+                for item in times if isinstance(times, list) else []:
+                    t = item.get("time") if isinstance(item, dict) else item
+                    if t:
+                        flat.append(t)
+            flat.sort()
+            if not flat:
+                result = {"status": "ok", "slots": [], "message": "No available slots in this range."}
+                if entries is not None:
+                    entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "check_availability_cal", "result": result})
+                return "There are no available slots in that date range. Suggest another date or a wider range."
+            result = {"status": "ok", "slots": flat[:50], "count": len(flat)}
+            if entries is not None:
+                entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "check_availability_cal", "result": result})
+            summary = ", ".join(flat[:10])
+            if len(flat) > 10:
+                summary += f" … and {len(flat) - 10} more."
+            return f"Available slots: {summary}. Tell the user these options and ask which time they prefer, then use book_appointment_cal to book it."
+        except Exception as e:
+            logger.exception("[check_availability_cal] failed: %s", e)
+            msg = str(e)
+            result = {"status": "error", "message": msg}
+            if entries is not None:
+                entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "check_availability_cal", "result": result})
+            return f"Could not check availability: {msg}"
+
+    @function_tool
+    async def book_appointment_cal(
+        self,
+        context: RunContext,
+        start: str,
+        attendee_name: str,
+        attendee_email: str,
+    ) -> str:
+        """Book an appointment on the calendar. Use after the user has chosen a time from the available slots. start must be the exact ISO 8601 time in UTC (e.g. 2024-08-13T14:00:00Z). attendee_name and attendee_email are the name and email of the person booking."""
+        entries = getattr(self, "transcript_entries", None)
+        tid = uuid.uuid4().hex[:16]
+        inp = {"start": start, "attendee_name": attendee_name, "attendee_email": attendee_email}
+        if entries is not None:
+            entries.append({"kind": "tool_invocation", "toolCallId": tid, "toolName": "book_appointment_cal", "input": inp})
+
+        cfg = self._cal_com_config(context, "book_appointment_cal")
+        api_key = (cfg.get("apiKey") or "").strip()
+        event_type_id_raw = (cfg.get("eventTypeId") or "").strip()
+        timezone = (cfg.get("timezone") or "UTC").strip() or "UTC"
+
+        if not api_key or not event_type_id_raw:
+            msg = "Calendar booking is not configured. Please set API key and Event Type ID in the dashboard."
+            result = {"status": "not_configured", "message": msg}
+            if entries is not None:
+                entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "book_appointment_cal", "result": result})
+            return msg
+
+        try:
+            event_type_id = int(event_type_id_raw)
+        except ValueError:
+            msg = "Event Type ID must be a number. Check the Cal.com event type URL."
+            result = {"status": "error", "message": msg}
+            if entries is not None:
+                entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "book_appointment_cal", "result": result})
+            return msg
+
+        # Cal.com v2: start must be UTC ISO 8601
+        if not start.endswith("Z") and "+" not in start and "-" not in start[-6:]:
+            start = start.replace(" ", "T") if "T" not in start else start
+            start = f"{start}Z" if start[-1] != "Z" else start
+
+        try:
+            import requests
+            url = "https://api.cal.com/v2/bookings"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "cal-api-version": "2024-08-13",
+                "Content-Type": "application/json",
+            }
+            body = {
+                "eventTypeId": event_type_id,
+                "start": start,
+                "attendee": {
+                    "name": attendee_name.strip(),
+                    "email": attendee_email.strip(),
+                    "timeZone": timezone,
+                },
+            }
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.post(url, json=body, headers=headers, timeout=15),
+            )
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                result = {"status": "booked", "response": data}
+                if entries is not None:
+                    entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "book_appointment_cal", "result": result})
+                return "The appointment has been booked successfully. Confirm the date and time to the customer and mention they will receive a calendar invite by email."
+            err = resp.json() if resp.text else {}
+            msg = err.get("message") or err.get("error") or resp.text or f"Cal.com returned {resp.status_code}"
+            result = {"status": "failed", "message": msg}
+            if entries is not None:
+                entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "book_appointment_cal", "result": result})
+            return f"Booking failed: {msg}. Ask the customer to try another time or contact support."
+        except Exception as e:
+            logger.exception("[book_appointment_cal] failed: %s", e)
+            msg = str(e)
+            result = {"status": "error", "message": msg}
+            if entries is not None:
+                entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "book_appointment_cal", "result": result})
+            return f"Booking failed: {msg}"
+
 
 server = AgentServer()
 
@@ -679,7 +847,21 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
             "directly or take a callback. Do NOT use end_call when transfer fails—only use end_call when the user "
             "says goodbye or is done with the conversation."
         )
-    instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}{transfer_call_rule}{backchannel_rule}{voicemail_rule}"
+    cal_availability_rule = ""
+    if "check_availability_cal" in enabled:
+        cal_availability_rule = (
+            "\n\nCALENDAR AVAILABILITY: You have check_availability_cal. When the user asks for available times, "
+            "when they can book, or for open slots, call it with start_date and end_date (YYYY-MM-DD). Then offer "
+            "the listed slots and ask which time they want; when they choose, use book_appointment_cal to book it."
+        )
+    cal_book_rule = ""
+    if "book_appointment_cal" in enabled:
+        cal_book_rule = (
+            "\n\nBOOK CALENDAR: You have book_appointment_cal. Use it to book an appointment after the user has "
+            "chosen a time. Pass the exact start time in UTC ISO format (e.g. 2024-08-13T14:00:00Z), and the "
+            "attendee's name and email. Confirm the booking to the customer after it succeeds."
+        )
+    instructions = f"{base}\n\n{voice_rules}\n\n{end_call_rule}{transfer_call_rule}{cal_availability_rule}{cal_book_rule}{backchannel_rule}{voicemail_rule}"
     speak_first = _welcome_mode_from_room(ctx) != "user"
 
     # Collect transcript for post-call extraction (call_analyzed webhook)
