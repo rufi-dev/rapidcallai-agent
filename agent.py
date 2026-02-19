@@ -420,22 +420,50 @@ class VoiceAgent(Agent):
 
     async def _fetch_agent_config_if_needed(self, context: RunContext) -> None:
         """When room metadata has empty toolConfigs but has agent id and workspaceId, fetch from server and cache."""
+        debug = {"source": "room_metadata", "hadAgentId": False, "hadWorkspaceId": False, "fetchAttempted": False, "fetchOk": False, "fetchError": None}
         if getattr(self, "_inbound_config", None) is not None:
+            debug["skipReason"] = "inbound_config_set"
+            setattr(self, "_last_agent_config_fetch_debug", debug)
             return
         meta = self._room_metadata(context)
         agent_node = meta.get("agent") or {}
         tool_configs = agent_node.get("toolConfigs") or {}
         if isinstance(tool_configs, dict) and len(tool_configs) > 0:
+            debug["skipReason"] = "toolConfigs_not_empty"
+            debug["toolConfigKeys"] = list(tool_configs.keys())
+            setattr(self, "_last_agent_config_fetch_debug", debug)
             return
         agent_id = (agent_node.get("id") or "").strip()
         workspace_id = (agent_node.get("workspaceId") or "").strip()
-        if not agent_id or not workspace_id:
+        debug["hadAgentId"] = bool(agent_id)
+        debug["hadWorkspaceId"] = bool(workspace_id)
+        if not agent_id:
+            debug["skipReason"] = "no_agent_id_in_metadata"
+            logger.info("[agent_config] skip fetch: no agent.id in room metadata (add agent.workspaceId and agent.id in server room metadata)")
+            setattr(self, "_last_agent_config_fetch_debug", debug)
+            return
+        if not workspace_id:
+            debug["skipReason"] = "no_workspace_id_in_metadata"
+            logger.info("[agent_config] skip fetch: no agent.workspaceId in room metadata (agentId=%s). Server must include workspaceId when creating room.", agent_id)
+            setattr(self, "_last_agent_config_fetch_debug", debug)
             return
         base_url = (os.environ.get("SERVER_BASE_URL") or os.environ.get("PUBLIC_API_BASE_URL") or "").strip().rstrip("/")
         secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
-        if not base_url or not secret:
+        if not base_url:
+            debug["skipReason"] = "no_SERVER_BASE_URL"
+            debug["fetchError"] = "SERVER_BASE_URL or PUBLIC_API_BASE_URL not set on agent"
+            logger.warning("[agent_config] skip fetch: SERVER_BASE_URL not set on agent process")
+            setattr(self, "_last_agent_config_fetch_debug", debug)
+            return
+        if not secret:
+            debug["skipReason"] = "no_AGENT_SHARED_SECRET"
+            debug["fetchError"] = "AGENT_SHARED_SECRET not set on agent"
+            logger.warning("[agent_config] skip fetch: AGENT_SHARED_SECRET not set on agent process")
+            setattr(self, "_last_agent_config_fetch_debug", debug)
             return
         url = f"{base_url}/api/internal/agents/config?workspaceId={workspace_id}&agentId={agent_id}"
+        debug["fetchAttempted"] = True
+        logger.info("[agent_config] fetching config from server: agentId=%s workspaceId=%s url=%s", agent_id, workspace_id, url)
         try:
             import requests
             resp = await asyncio.get_event_loop().run_in_executor(
@@ -446,9 +474,19 @@ class VoiceAgent(Agent):
                 data = resp.json()
                 if isinstance(data.get("toolConfigs"), dict):
                     setattr(self, "_fetched_agent_config", data)
-                    logger.info("[agent_config] fetched toolConfigs from server (room metadata had none), keys=%s", list(data.get("toolConfigs", {}).keys()))
+                    debug["fetchOk"] = True
+                    debug["fetchedKeys"] = list(data.get("toolConfigs", {}).keys())
+                    logger.info("[agent_config] fetched toolConfigs from server, keys=%s", debug["fetchedKeys"])
+                else:
+                    debug["fetchError"] = "response missing toolConfigs"
+                    logger.warning("[agent_config] server response missing toolConfigs: status=%s", resp.status_code)
+            else:
+                debug["fetchError"] = f"http_{resp.status_code}"
+                logger.warning("[agent_config] fetch failed: status=%s body=%s", resp.status_code, (resp.text or "")[:200])
         except Exception as e:
+            debug["fetchError"] = str(e)
             logger.warning("[agent_config] failed to fetch config from server: %s", e)
+        setattr(self, "_last_agent_config_fetch_debug", debug)
 
     @function_tool
     async def lookup_weather(
@@ -508,9 +546,21 @@ class VoiceAgent(Agent):
             return msg
 
         if not transfer_to:
-            logger.warning("[transfer] skipped: reason=no_transfer_number toolConfigs.transfer_call=%s", transfer_cfg)
+            tool_keys = list(tool_configs.keys()) if isinstance(tool_configs, dict) else []
+            logger.warning(
+                "[transfer] skipped: reason=no_transfer_number toolConfigs.transfer_call=%s toolConfigKeysReceived=%s",
+                transfer_cfg,
+                tool_keys,
+            )
             msg = "No transfer number configured. Please inform the customer and offer to help them directly or take a callback number."
-            result = {"status": "not_configured", "message": msg}
+            result = {
+                "status": "not_configured",
+                "message": msg,
+                "callHistoryDebug": {
+                    "toolConfigKeysReceived": tool_keys,
+                    "hint": "If empty, saved config is not reaching the agent. Set Transfer to (phone number) in Functions → Transfer call → Save and start a new call.",
+                },
+            }
             if entries is not None:
                 entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "transfer_call", "result": result})
             return msg
@@ -525,24 +575,40 @@ class VoiceAgent(Agent):
             logger.warning("[transfer] skipped: reason=no_AGENT_SHARED_SECRET")
         if not call_id or not base_url or not secret:
             msg = "Transfer service unavailable. Please inform the customer and offer to try again or help them directly."
-            result = {"status": "error", "message": msg}
+            result = {
+                "status": "error",
+                "message": msg,
+                "callHistoryDebug": {
+                    "hasCallId": bool(call_id),
+                    "hasServerBaseUrl": bool(base_url),
+                    "hasAgentSecret": bool(secret),
+                    "hint": "Agent needs SERVER_BASE_URL and AGENT_SHARED_SECRET to call transfer API.",
+                },
+            }
             if entries is not None:
                 entries.append({"kind": "tool_result", "toolCallId": tid, "toolName": "transfer_call", "result": result})
             return msg
 
-        logger.info("[transfer] calling server: url=%s/api/internal/calls/%s/transfer transferTo=%s", base_url, call_id, transfer_to)
+        transfer_url = f"{base_url}/api/internal/calls/{call_id}/transfer"
+        logger.info("[transfer] calling server: url=%s transferTo=%s", transfer_url, transfer_to)
         try:
             import requests
             resp = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: requests.post(
-                    f"{base_url}/api/internal/calls/{call_id}/transfer",
+                    transfer_url,
                     json={"transferTo": transfer_to},
                     headers={"x-agent-secret": secret, "content-type": "application/json"},
                     timeout=15,
                 ),
             )
-            logger.info("[transfer] server response: status=%s body=%s", resp.status_code, (resp.text or "")[:300])
+            logger.info(
+                "[transfer] server response: status=%s body=%s",
+                resp.status_code,
+                (resp.text or "")[:300],
+            )
+            if resp.status_code != 200:
+                logger.warning("[transfer] transfer failed: status=%s", resp.status_code)
             if resp.status_code == 200:
                 result = {"status": "transferred", "execution_message": execution_message}
                 if entries is not None:
@@ -638,12 +704,19 @@ class VoiceAgent(Agent):
                 "'Check Calendar Availability (Cal.com)' → click the pencil → enter your Cal.com API Key and Event Type ID → Save. "
                 "Get the API key from Cal.com Settings → Security; Event Type ID is in your Cal.com booking URL."
             )
+            fetch_debug = getattr(self, "_last_agent_config_fetch_debug", None) or {}
             result = {
                 "status": "not_configured",
                 "message": msg,
                 "callHistoryDebug": {
                     "toolConfigKeysReceived": config_keys_received,
-                    "hint": "If toolConfigKeysReceived does not contain 'check_availability_cal', the saved config is not reaching the agent. Save the tool again and start a new call.",
+                    "roomMetadataHadAgentId": fetch_debug.get("hadAgentId"),
+                    "roomMetadataHadWorkspaceId": fetch_debug.get("hadWorkspaceId"),
+                    "configFetchAttempted": fetch_debug.get("fetchAttempted"),
+                    "configFetchOk": fetch_debug.get("fetchOk"),
+                    "configFetchSkipReason": fetch_debug.get("skipReason"),
+                    "configFetchError": fetch_debug.get("fetchError"),
+                    "hint": "If toolConfigKeysReceived is empty: check configFetchSkipReason (e.g. no_workspace_id_in_metadata → server must send agent.workspaceId in room metadata). Set SERVER_BASE_URL and AGENT_SHARED_SECRET on the agent process for fallback fetch.",
                 },
             }
             if entries is not None:
@@ -765,12 +838,19 @@ class VoiceAgent(Agent):
                 "Calendar booking is not configured. In the dashboard go to Agent → Functions → enable "
                 "'Book on the Calendar (Cal.com)' → click the pencil → enter your Cal.com API Key and Event Type ID → Save."
             )
+            fetch_debug = getattr(self, "_last_agent_config_fetch_debug", None) or {}
             result = {
                 "status": "not_configured",
                 "message": msg,
                 "callHistoryDebug": {
                     "toolConfigKeysReceived": config_keys_received,
-                    "hint": "If toolConfigKeysReceived does not contain 'book_appointment_cal', the saved config is not reaching the agent.",
+                    "roomMetadataHadAgentId": fetch_debug.get("hadAgentId"),
+                    "roomMetadataHadWorkspaceId": fetch_debug.get("hadWorkspaceId"),
+                    "configFetchAttempted": fetch_debug.get("fetchAttempted"),
+                    "configFetchOk": fetch_debug.get("fetchOk"),
+                    "configFetchSkipReason": fetch_debug.get("skipReason"),
+                    "configFetchError": fetch_debug.get("fetchError"),
+                    "hint": "If toolConfigKeysReceived is empty, check configFetchSkipReason and set SERVER_BASE_URL + AGENT_SHARED_SECRET on agent for fallback fetch.",
                 },
             }
             if entries is not None:
