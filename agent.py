@@ -1088,11 +1088,54 @@ async def _ensure_inbound_config(ctx: JobContext) -> dict | None:
             break
         if attempt < 3:
             await asyncio.sleep(0.5 + attempt * 0.5)
+    # Fallback: if we still don't have (to, from), try each E.164 in the room name as "to" (dialed number).
+    # LiveKit SIP room names often include the number; server returns 404 if number not in DB.
     if not to:
+        import re
+        # Log what we have so operators can see LiveKit room/participant shape.
+        try:
+            kind_sip = getattr(rtc.ParticipantKind, "PARTICIPANT_KIND_SIP", None)
+            for p in getattr(ctx.room, "remote_participants", {}).values():
+                if getattr(p, "kind", None) == kind_sip:
+                    attrs = getattr(p, "attributes", None) or {}
+                    logger.info(
+                        "Inbound config: SIP participant attributes for room %s: %s",
+                        room_name[:50],
+                        dict(attrs),
+                    )
+                    break
+        except Exception as e:
+            logger.debug("Inbound config: could not log SIP attributes: %s", e)
+        e164_in_room = re.findall(r"\+\d{10,15}", room_name)
+        import requests
+        url = f"{base_url}/api/internal/telephony/inbound/start"
+        for candidate_to in e164_in_room:
+            try:
+                body = {"roomName": room_name, "to": candidate_to, "from": ""}
+                resp = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda b=body: requests.post(
+                        url,
+                        json=b,
+                        headers={"x-agent-secret": secret, "content-type": "application/json"},
+                        timeout=10,
+                    ),
+                )
+                if resp.status_code in (200, 201):
+                    data = resp.json() if resp.text else {}
+                    logger.info(
+                        "Inbound config: got agent config for %s using E.164 from room name (to=%s)",
+                        room_name[:60],
+                        candidate_to,
+                    )
+                    return data
+            except Exception as e:
+                logger.debug("Inbound config: try to=%s failed: %s", candidate_to, e)
         logger.warning(
-            "Inbound config: could not get 'to' (dialed number) from SIP attributes or room name=%s. "
-            "Ensure LiveKit SIP participant has sip.trunkPhoneNumber / sip.phoneNumber attributes or room name contains E.164.",
+            "Inbound config: could not get 'to' from SIP attributes or room name=%s (tried E.164s: %s). "
+            "Ensure LiveKit SIP participant has sip.trunkPhoneNumber / sip.phoneNumber or room name contains dialed E.164.",
             room_name[:80],
+            e164_in_room[:5],
         )
         return None
     url = f"{base_url}/api/internal/telephony/inbound/start"
