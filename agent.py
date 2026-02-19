@@ -435,16 +435,21 @@ class VoiceAgent(Agent):
             return
         agent_id = (agent_node.get("id") or "").strip()
         workspace_id = (agent_node.get("workspaceId") or "").strip()
+        # When LiveKit doesn't deliver room metadata (e.g. webtest), derive agentId from room name: call-{agentId}-{nanoid}
+        if not agent_id:
+            room = getattr(context, "room", None)
+            room_name = (getattr(room, "name", None) or "").strip()
+            if room_name and "-" in room_name:
+                parts = room_name.split("-", 2)
+                if len(parts) >= 2 and parts[0].lower() == "call":
+                    agent_id = (parts[1] or "").strip()
+                    debug["agentIdFromRoomName"] = agent_id
+                    logger.info("[agent_config] no agent.id in metadata; using agentId from room name: %s", agent_id)
         debug["hadAgentId"] = bool(agent_id)
         debug["hadWorkspaceId"] = bool(workspace_id)
         if not agent_id:
-            debug["skipReason"] = "no_agent_id_in_metadata"
-            logger.info("[agent_config] skip fetch: no agent.id in room metadata (add agent.workspaceId and agent.id in server room metadata)")
-            setattr(self, "_last_agent_config_fetch_debug", debug)
-            return
-        if not workspace_id:
-            debug["skipReason"] = "no_workspace_id_in_metadata"
-            logger.info("[agent_config] skip fetch: no agent.workspaceId in room metadata (agentId=%s). Server must include workspaceId when creating room.", agent_id)
+            debug["skipReason"] = "no_agent_id_in_metadata_or_room_name"
+            logger.info("[agent_config] skip fetch: no agent.id in room metadata and could not parse from room name")
             setattr(self, "_last_agent_config_fetch_debug", debug)
             return
         base_url = (os.environ.get("SERVER_BASE_URL") or os.environ.get("PUBLIC_API_BASE_URL") or "").strip().rstrip("/")
@@ -461,9 +466,13 @@ class VoiceAgent(Agent):
             logger.warning("[agent_config] skip fetch: AGENT_SHARED_SECRET not set on agent process")
             setattr(self, "_last_agent_config_fetch_debug", debug)
             return
-        url = f"{base_url}/api/internal/agents/config?workspaceId={workspace_id}&agentId={agent_id}"
+        # API accepts workspaceId+agentId or agentId only (server looks up by id when workspaceId omitted)
+        if workspace_id:
+            url = f"{base_url}/api/internal/agents/config?workspaceId={workspace_id}&agentId={agent_id}"
+        else:
+            url = f"{base_url}/api/internal/agents/config?agentId={agent_id}"
         debug["fetchAttempted"] = True
-        logger.info("[agent_config] fetching config from server: agentId=%s workspaceId=%s url=%s", agent_id, workspace_id, url)
+        logger.info("[agent_config] fetching config from server: agentId=%s workspaceId=%s url=%s", agent_id, workspace_id or "(omit)", url)
         try:
             import requests
             resp = await asyncio.get_event_loop().run_in_executor(
@@ -1246,7 +1255,7 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
             await asyncio.sleep(5.0)
             await _sync_transcript_to_server()
 
-    def _cancel_transcript_sync():
+    async def _cancel_transcript_sync():
         if _transcript_sync_task:
             _transcript_sync_task.cancel()
 
@@ -1256,7 +1265,7 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
     except Exception as e:
         logger.debug("Could not start transcript sync task: %s", e)
 
-    def _on_shutdown_push_transcript():
+    async def _on_shutdown_push_transcript():
         """On shutdown (e.g. user hung up), push transcript once so call detail has full transcript."""
         if not transcript_entries:
             return
@@ -1267,11 +1276,14 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
             return
         try:
             import requests
-            requests.post(
-                f"{base_url}/api/internal/calls/{call_id}/transcript",
-                json={"transcript": list(transcript_entries)},
-                headers={"x-agent-secret": secret, "content-type": "application/json"},
-                timeout=5,
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.post(
+                    f"{base_url}/api/internal/calls/{call_id}/transcript",
+                    json={"transcript": list(transcript_entries)},
+                    headers={"x-agent-secret": secret, "content-type": "application/json"},
+                    timeout=5,
+                ),
             )
             logger.info("Shutdown: pushed transcript (%d entries) for call %s", len(transcript_entries), call_id)
         except Exception as e:
@@ -1421,7 +1433,7 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
             except Exception as e:
                 logger.warning("Periodic latency post failed: %s", e)
 
-    def _cancel_latency_task():
+    async def _cancel_latency_task():
         if _latency_task:
             _latency_task.cancel()
 
@@ -1514,7 +1526,7 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
             else:
                 inactivity_prompted_at = None
 
-    def _cancel_loop_task():
+    async def _cancel_loop_task():
         if loop_task:
             loop_task.cancel()
 
@@ -1552,7 +1564,7 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
                             await background_audio.start(room=ctx.room, agent_session=session)
                         except Exception as e:
                             logger.warning("Background audio start failed: %s", e)
-                    def _cancel_bg_audio():
+                    async def _cancel_bg_audio():
                         if bg_audio_task:
                             bg_audio_task.cancel()
 
