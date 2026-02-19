@@ -17,6 +17,7 @@ import random
 import time
 import uuid
 from collections.abc import AsyncIterable
+from datetime import date, datetime, timedelta
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -518,24 +519,48 @@ class VoiceAgent(Agent):
         cfg = (meta.get("agent") or {}).get("toolConfigs") or {}
         return cfg.get(tool_id) or {}
 
+    def _today_and_month_ahead(self, timezone_str: str) -> tuple[str, str]:
+        """Return (start_date, end_date) as YYYY-MM-DD: today and one month from today in the given timezone."""
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(timezone_str)
+            # Use local date in that timezone (e.g. still Monday in LA when Tuesday in UTC)
+            now = datetime.now(tz)
+            start_d = now.date()
+            # One month ahead: same day next month, or last day of next month
+            year, month = start_d.year, start_d.month
+            if month == 12:
+                end_d = start_d.replace(year=year + 1, month=1)
+            else:
+                end_d = start_d.replace(month=month + 1)
+            return start_d.isoformat(), end_d.isoformat()
+        except Exception:
+            start_d = date.today()
+            end_d = start_d + timedelta(days=31)
+            return start_d.isoformat(), end_d.isoformat()
+
     @function_tool
     async def check_availability_cal(
         self,
         context: RunContext,
-        start_date: str,
-        end_date: str,
+        start_date: str = "",
+        end_date: str = "",
     ) -> str:
-        """Check calendar availability for the given date range. Use when the user asks for available times, slots, or when they can book. start_date and end_date must be in YYYY-MM-DD format (e.g. 2024-08-13). Returns a list of available slot times the user can choose from."""
+        """Check calendar availability. Use when the user asks for available times, slots, or when they can book. By default use from today through one month from today: leave start_date and end_date empty or omit them. Only pass start_date and end_date (YYYY-MM-DD) if the user asks for a specific range. Returns a list of available slot times the user can choose from."""
+        cfg = self._cal_com_config(context, "check_availability_cal")
+        timezone = (cfg.get("timezone") or "UTC").strip() or "UTC"
+        start_date = (start_date or "").strip()
+        end_date = (end_date or "").strip()
+        if not start_date or not end_date:
+            start_date, end_date = self._today_and_month_ahead(timezone)
         entries = getattr(self, "transcript_entries", None)
         tid = uuid.uuid4().hex[:16]
         inp = {"start_date": start_date, "end_date": end_date}
         if entries is not None:
             entries.append({"kind": "tool_invocation", "toolCallId": tid, "toolName": "check_availability_cal", "input": inp})
 
-        cfg = self._cal_com_config(context, "check_availability_cal")
         api_key = (cfg.get("apiKey") or "").strip()
         event_type_id = (cfg.get("eventTypeId") or "").strip()
-        timezone = (cfg.get("timezone") or "UTC").strip() or "UTC"
 
         if not api_key or not event_type_id:
             msg = "Calendar availability is not configured. Please set API key and Event Type ID in the dashboard."
@@ -851,8 +876,7 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
     if "check_availability_cal" in enabled:
         cal_availability_rule = (
             "\n\nCALENDAR AVAILABILITY: You have check_availability_cal. When the user asks for available times, "
-            "when they can book, or for open slots, call it with start_date and end_date (YYYY-MM-DD). Then offer "
-            "the listed slots and ask which time they want; when they choose, use book_appointment_cal to book it."
+            "when they can book, or for open slots, call it without start_date and end_date (or leave them empty) so it uses from today through one month ahead. Only pass specific dates if the user asks for a particular range. Then offer the listed slots and ask which time they want; when they choose, use book_appointment_cal to book it."
         )
     cal_book_rule = ""
     if "book_appointment_cal" in enabled:
