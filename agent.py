@@ -1086,6 +1086,32 @@ async def _ensure_inbound_config(ctx: JobContext) -> dict | None:
     room_name = getattr(ctx.room, "name", None) or ""
     if not room_name:
         return None
+    # Outbound rooms (out-<jobId>): no E.164 in name; get config by room name from server.
+    if room_name.strip().startswith("out-"):
+        import requests
+        url = f"{base_url}/api/internal/telephony/outbound/start"
+        try:
+            body = {"roomName": room_name}
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.post(
+                    url,
+                    json=body,
+                    headers={"x-agent-secret": secret, "content-type": "application/json"},
+                    timeout=10,
+                ),
+            )
+            if resp.status_code in (200, 201):
+                data = resp.json() if resp.text else {}
+                logger.info(
+                    "Inbound config: got agent config for outbound room %s (outbound/start)",
+                    room_name[:60],
+                )
+                return data
+            logger.debug("Inbound config: outbound/start returned %s for %s", resp.status_code, room_name[:50])
+        except Exception as e:
+            logger.debug("Inbound config: outbound/start failed for %s: %s", room_name[:50], e)
+        # Fall through to try inbound (to/from) if outbound/start failed (e.g. call not in DB yet).
     # Retry getting (to, from): SIP participant may join shortly after we connect.
     to, from_ = None, None
     for attempt in range(4):

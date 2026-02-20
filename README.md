@@ -61,7 +61,8 @@ When the user asks for available dates/slots on a **phone** call and gets "I can
 
 **Agent logs** — search for:
 - `[check_availability_cal] not_configured on phone call` — shows `toolConfigKeysReceived=` and `configFetchSkipReason=` (why config was missing).
-- `Inbound config: got agent config for` — inbound/start succeeded; if you never see this on phone, inbound config is failing.
+- `Inbound config: got agent config for` — inbound/start or outbound/start succeeded; if you never see this on phone, config is failing.
+- For **outbound** rooms (`out-*`), the agent calls `outbound/start` by room name (no dialed number needed).
 - `Inbound config: could not get 'to' from` — agent couldn't get dialed number; see `(tried E.164s: ...)`.
 - `Inbound config: SIP participant attributes for room` — shows what LiveKit sent (e.g. sip.trunkPhoneNumber).
 - `Inbound config: skip (no SERVER_BASE_URL or AGENT_SHARED_SECRET)` — set both env vars on the agent.
@@ -71,3 +72,4 @@ When the user asks for available dates/slots on a **phone** call and gets "I can
 - `[internal.telephony.inbound.start]` with roomName, to, from — request params.
 - `[internal.telephony.inbound.start] room metadata updated` — server set room metadata.
 - `[internal.telephony.inbound.start] phone number not found` — the "to" sent isn't in your DB.
+- For **outbound**: `[internal.telephony.outbound.start] request received` / `returning config for outbound call` — agent got config by room name; `call not found for room` means no call record for that room yet.
