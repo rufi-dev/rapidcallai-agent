@@ -954,14 +954,15 @@ async def _ensure_inbound_config(ctx: JobContext) -> dict | None:
     """
     For inbound telephony: if room has no agent config, call the server's inbound/start
     or outbound/start (for room names starting with "out-") and return the response.
-    Returns the JSON response dict on success, None otherwise.
+    For outbound rooms we always call outbound/start so we get toolConfigs (room metadata
+    may be missing or empty when the agent joins). Returns the JSON response dict on success, None otherwise.
     """
-    if _room_has_agent_config(ctx):
-        return None
     room_name = (getattr(ctx.room, "name", None) or "").strip()
+    is_outbound = room_name.startswith("out-")
+    if _room_has_agent_config(ctx) and not is_outbound:
+        return None
     base_url = (os.environ.get("SERVER_BASE_URL") or os.environ.get("PUBLIC_API_BASE_URL") or "").strip().rstrip("/")
     secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
-    is_outbound = room_name.startswith("out-")
     logger.info(
         "Inbound config: room=%s has_base_url=%s has_secret=%s is_outbound=%s",
         room_name[:60] or "(empty)",
@@ -1113,10 +1114,14 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
     await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_NONE)
 
     # Give SIP participant a moment to appear in remote_participants so we can read sip.trunkPhoneNumber / sip.phoneNumber.
-    if inbound_config is None and not _room_has_agent_config(ctx):
+    room_name = (getattr(ctx.room, "name", None) or "").strip()
+    need_config = inbound_config is None and (
+        not _room_has_agent_config(ctx) or room_name.startswith("out-")
+    )
+    if need_config and not room_name.startswith("out-"):
         await asyncio.sleep(0.5)
-    # For inbound telephony: fetch agent config from our API using (to, from) from SIP attributes. Use response directly.
-    if inbound_config is None and not _room_has_agent_config(ctx):
+    # For inbound telephony: fetch agent config from our API. For outbound (out-*) always fetch so we get toolConfigs.
+    if need_config:
         inbound_config = await _ensure_inbound_config(ctx)
     if inbound_config is not None:
         ud = getattr(ctx.proc, "userdata", None)
