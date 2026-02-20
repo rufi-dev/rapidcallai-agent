@@ -1081,7 +1081,9 @@ async def _ensure_inbound_config(ctx: JobContext) -> dict | None:
     base_url = (os.environ.get("SERVER_BASE_URL") or os.environ.get("PUBLIC_API_BASE_URL") or "").strip().rstrip("/")
     secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
     if not base_url or not secret:
-        logger.debug("Inbound config: skip (no SERVER_BASE_URL or AGENT_SHARED_SECRET)")
+        logger.info(
+            "Inbound config: skip (set SERVER_BASE_URL or PUBLIC_API_BASE_URL and AGENT_SHARED_SECRET on agent)"
+        )
         return None
     room_name = getattr(ctx.room, "name", None) or ""
     if not room_name:
@@ -1092,6 +1094,7 @@ async def _ensure_inbound_config(ctx: JobContext) -> dict | None:
         url = f"{base_url}/api/internal/telephony/outbound/start"
         headers = {"x-agent-secret": secret, "content-type": "application/json"}
         body = {"roomName": room_name}
+        logger.info("Inbound config: calling outbound/start for room %s", room_name[:60])
         for attempt in range(2):
             try:
                 resp = await asyncio.get_event_loop().run_in_executor(
