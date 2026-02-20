@@ -598,7 +598,7 @@ class VoiceAgent(Agent):
                     "hasCallId": bool(call_id),
                     "hasServerBaseUrl": bool(base_url),
                     "hasAgentSecret": bool(secret),
-                    "hint": "Agent needs SERVER_BASE_URL and AGENT_SHARED_SECRET to call transfer API.",
+                    "hint": "Agent needs SERVER_BASE_URL or PUBLIC_API_BASE_URL and AGENT_SHARED_SECRET to call transfer API.",
                 },
             }
             if entries is not None:
@@ -761,7 +761,7 @@ class VoiceAgent(Agent):
             fetch_debug = getattr(self, "_last_agent_config_fetch_debug", None) or {}
             skip_reason = fetch_debug.get("skipReason") or "unknown"
             logger.info(
-                "[check_availability_cal] not_configured on phone call: toolConfigKeysReceived=%s configFetchSkipReason=%s (fix: ensure inbound/start returns config; set SERVER_BASE_URL and AGENT_SHARED_SECRET on agent)",
+                "[check_availability_cal] not_configured on phone call: toolConfigKeysReceived=%s configFetchSkipReason=%s (fix: ensure inbound/start or outbound/start returns config; set SERVER_BASE_URL or PUBLIC_API_BASE_URL and AGENT_SHARED_SECRET on agent)",
                 config_keys_received,
                 skip_reason,
             )
@@ -776,7 +776,7 @@ class VoiceAgent(Agent):
                     "configFetchOk": fetch_debug.get("fetchOk"),
                     "configFetchSkipReason": fetch_debug.get("skipReason"),
                     "configFetchError": fetch_debug.get("fetchError"),
-                    "hint": "If toolConfigKeysReceived is empty: check configFetchSkipReason (e.g. no_workspace_id_in_metadata → server must send agent.workspaceId in room metadata). Set SERVER_BASE_URL and AGENT_SHARED_SECRET on the agent process for fallback fetch.",
+                    "hint": "If toolConfigKeysReceived is empty: check configFetchSkipReason (e.g. no_workspace_id_in_metadata → server must send agent.workspaceId in room metadata). Set SERVER_BASE_URL or PUBLIC_API_BASE_URL and AGENT_SHARED_SECRET on the agent for fallback fetch.",
                 },
             }
             if entries is not None:
@@ -919,7 +919,7 @@ class VoiceAgent(Agent):
                     "configFetchOk": fetch_debug.get("fetchOk"),
                     "configFetchSkipReason": fetch_debug.get("skipReason"),
                     "configFetchError": fetch_debug.get("fetchError"),
-                    "hint": "If toolConfigKeysReceived is empty, check configFetchSkipReason and set SERVER_BASE_URL + AGENT_SHARED_SECRET on agent for fallback fetch.",
+                    "hint": "If toolConfigKeysReceived is empty, check configFetchSkipReason and set SERVER_BASE_URL or PUBLIC_API_BASE_URL and AGENT_SHARED_SECRET on agent for fallback fetch.",
                 },
             }
             if entries is not None:
@@ -1090,27 +1090,47 @@ async def _ensure_inbound_config(ctx: JobContext) -> dict | None:
     if room_name.strip().startswith("out-"):
         import requests
         url = f"{base_url}/api/internal/telephony/outbound/start"
-        try:
-            body = {"roomName": room_name}
-            resp = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: requests.post(
-                    url,
-                    json=body,
-                    headers={"x-agent-secret": secret, "content-type": "application/json"},
-                    timeout=10,
-                ),
-            )
-            if resp.status_code in (200, 201):
-                data = resp.json() if resp.text else {}
-                logger.info(
-                    "Inbound config: got agent config for outbound room %s (outbound/start)",
-                    room_name[:60],
+        headers = {"x-agent-secret": secret, "content-type": "application/json"}
+        body = {"roomName": room_name}
+        for attempt in range(2):
+            try:
+                resp = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda b=body, h=headers: requests.post(url, json=b, headers=h, timeout=10),
                 )
-                return data
-            logger.debug("Inbound config: outbound/start returned %s for %s", resp.status_code, room_name[:50])
-        except Exception as e:
-            logger.debug("Inbound config: outbound/start failed for %s: %s", room_name[:50], e)
+                if resp.status_code in (200, 201):
+                    data = resp.json() if resp.text else {}
+                    if isinstance(data.get("toolConfigs"), dict) or "agent" in data:
+                        logger.info(
+                            "Inbound config: got agent config for outbound room %s (outbound/start)",
+                            room_name[:60],
+                        )
+                        return data
+                    logger.warning(
+                        "Inbound config: outbound/start for %s returned 200 but missing toolConfigs/agent: %s",
+                        room_name[:50],
+                        list(data.keys())[:10],
+                    )
+                else:
+                    if resp.status_code == 404 and attempt == 0:
+                        await asyncio.sleep(2)
+                        continue
+                    logger.warning(
+                        "Inbound config: outbound/start returned %s for %s: %s",
+                        resp.status_code,
+                        room_name[:50],
+                        (resp.text or "")[:200],
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Inbound config: outbound/start failed for %s: %s",
+                    room_name[:50],
+                    e,
+                )
+                if attempt == 0:
+                    await asyncio.sleep(2)
+                    continue
+            break
         # Fall through to try inbound (to/from) if outbound/start failed (e.g. call not in DB yet).
     # Retry getting (to, from): SIP participant may join shortly after we connect.
     to, from_ = None, None
@@ -1282,7 +1302,7 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
     async def _post_end_call_to_server() -> None:
         """POST to RapidCall API so it can hang up the SIP leg, run extraction, and send call_ended/call_analyzed webhooks."""
         call_id = _call_id_from_room(ctx)
-        base_url = (os.environ.get("SERVER_BASE_URL") or "").strip().rstrip("/")
+        base_url = (os.environ.get("SERVER_BASE_URL") or os.environ.get("PUBLIC_API_BASE_URL") or "").strip().rstrip("/")
         secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
         if not call_id or not base_url or not secret:
             logger.debug("End call: not posting to server (missing call_id, SERVER_BASE_URL, or AGENT_SHARED_SECRET)")

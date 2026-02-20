@@ -19,6 +19,10 @@ Minimal voice agent aligned with official LiveKit examples only.
 - **MCP (optional):** Set `MCP_SERVER_URL=http://localhost:8000/sse` and run `mcp_server.py`. Install with `pip install 'livekit-agents[mcp]'`.
 - **Plugins:** See `requirements.txt` for optional plugins (anthropic, assemblyai, google, groq, nvidia, etc.). NVIDIA is included for STT/TTS.
 
+## Environment (phone / server API)
+
+For phone calls the agent calls your server for config (inbound/start or outbound/start). Set **either** `SERVER_BASE_URL` **or** `PUBLIC_API_BASE_URL` to your API base (e.g. `https://api.rapidcall.ai`) and `AGENT_SHARED_SECRET` to the same value as on the server. The server does not need `SERVER_BASE_URL`; it only needs `AGENT_SHARED_SECRET` and optionally `PUBLIC_API_BASE_URL` for links.
+
 ## Local run
 
 ```bash
