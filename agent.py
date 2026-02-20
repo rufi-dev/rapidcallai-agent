@@ -953,24 +953,32 @@ def _get_inbound_to_from(ctx: JobContext) -> tuple[str | None, str | None]:
 async def _ensure_inbound_config(ctx: JobContext) -> dict | None:
     """
     For inbound telephony: if room has no agent config, call the server's inbound/start
-    and return the response so we use it directly (no reliance on room metadata propagation).
+    or outbound/start (for room names starting with "out-") and return the response.
     Returns the JSON response dict on success, None otherwise.
-    Retries getting (to, from) a few times so SIP participant attributes are available.
     """
     if _room_has_agent_config(ctx):
         return None
+    room_name = (getattr(ctx.room, "name", None) or "").strip()
     base_url = (os.environ.get("SERVER_BASE_URL") or os.environ.get("PUBLIC_API_BASE_URL") or "").strip().rstrip("/")
     secret = (os.environ.get("AGENT_SHARED_SECRET") or "").strip()
+    is_outbound = room_name.startswith("out-")
+    logger.info(
+        "Inbound config: room=%s has_base_url=%s has_secret=%s is_outbound=%s",
+        room_name[:60] or "(empty)",
+        bool(base_url),
+        bool(secret),
+        is_outbound,
+    )
     if not base_url or not secret:
         logger.info(
             "Inbound config: skip (set SERVER_BASE_URL or PUBLIC_API_BASE_URL and AGENT_SHARED_SECRET on agent)"
         )
         return None
-    room_name = getattr(ctx.room, "name", None) or ""
     if not room_name:
+        logger.info("Inbound config: skip (empty room name)")
         return None
-    # Outbound rooms (out-<jobId>): no E.164 in name; get config by room name from server.
-    if room_name.strip().startswith("out-"):
+    # Outbound rooms (out-<jobId>): get config by room name from server; server will also set room metadata.
+    if is_outbound:
         import requests
         url = f"{base_url}/api/internal/telephony/outbound/start"
         headers = {"x-agent-secret": secret, "content-type": "application/json"}
