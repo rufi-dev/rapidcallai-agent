@@ -26,13 +26,17 @@ For phone calls the agent calls your server for config (inbound/start or outboun
 
 ## Local run
 
+Use the project venv so the correct `livekit-agents` version is used (avoid global Python, which can cause `ImportError: cannot import name 'AgentServer'`).
+
 ```bash
 cd python-agent
 py -3.13 -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-python agent.py console
+python agent.py dev
 ```
+
+In **dev** mode the process stays idle after “registered worker”—that’s normal. It’s waiting for a job. Trigger a call (e.g. from your app’s web UI or an outbound call) and you’ll see session logs in this terminal. Use **console** mode for interactive testing without a real call: `python agent.py console`.
 
 ## MCP server (optional)
 

@@ -647,7 +647,7 @@ class VoiceAgent(Agent):
     # --- Cal.com API v2 (https://cal.com/docs/api-reference/v2): slots + bookings. Errors from API or server only. ---
 
     def _cal_config(self, context: RunContext, tool_key: str) -> dict:
-        """Read apiKey, eventTypeId, timezone from toolConfigs for the given tool key."""
+        """Read apiKey, eventTypeId, timezone from toolConfigs for the given tool key. Config comes from the server (room metadata or inbound/start / outbound/start); customers set Cal.com in the dashboard."""
         meta = self._room_metadata(context)
         configs = (meta.get("agent") or {}).get("toolConfigs") or {}
         if not isinstance(configs, dict):
