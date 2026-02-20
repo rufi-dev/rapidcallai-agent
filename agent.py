@@ -183,6 +183,43 @@ def _enabled_tools_from_room(ctx: JobContext) -> list[str]:
         return ["end_call"]
 
 
+def _tool_configs_from_room(ctx: JobContext) -> dict:
+    """Read agent.toolConfigs from inbound_config or room metadata."""
+    cfg = _inbound_config_from_ctx(ctx)
+    if cfg is not None:
+        agent = cfg.get("agent") or {}
+        tc = agent.get("toolConfigs") if isinstance(agent.get("toolConfigs"), dict) else cfg.get("toolConfigs")
+        return tc if isinstance(tc, dict) else {}
+    raw = getattr(ctx.room, "metadata", None)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        agent = data.get("agent") or {}
+        return agent.get("toolConfigs") if isinstance(agent.get("toolConfigs"), dict) else {}
+    except Exception:
+        return {}
+
+
+def _is_transfer_call_key(key: str) -> bool:
+    """True if this enabled-tool key is a transfer_call instance (transfer_call or transfer_call_2, etc.)."""
+    return key == "transfer_call" or (key.startswith("transfer_call_") and key != "transfer_call")
+
+
+def _transfer_instance_keys_with_names(ctx: JobContext) -> list[tuple[str, str]]:
+    """Return list of (config_key, display_name) for each transfer_call instance in enabled tools."""
+    enabled = _enabled_tools_from_room(ctx)
+    tool_configs = _tool_configs_from_room(ctx)
+    out: list[tuple[str, str]] = []
+    for key in enabled:
+        if not _is_transfer_call_key(key):
+            continue
+        cfg = tool_configs.get(key) or {}
+        name = (cfg.get("name") or "").strip() or key
+        out.append((key, name))
+    return out
+
+
 def _backchannel_enabled_from_room(ctx: JobContext) -> bool:
     """Read agent.backchannelEnabled from inbound_config or room metadata."""
     cfg = _inbound_config_from_ctx(ctx)
@@ -522,9 +559,12 @@ class VoiceAgent(Agent):
 
     @function_tool
     async def transfer_call(
-        self, context: RunContext, execution_message: str = "Connecting you now."
+        self,
+        context: RunContext,
+        execution_message: str = "Connecting you now.",
+        config_key: str = "transfer_call",
     ) -> str:
-        """Transfer the call to another number (e.g. live agent). Use when the user asks to be transferred. Provide a brief execution_message to say while transferring."""
+        """Transfer the call to another number (e.g. live agent). Use when the user asks to be transferred. Use config_key to choose which transfer destination (e.g. transfer_call for first, transfer_call_2 for second). Provide a brief execution_message to say while transferring."""
         entries = getattr(self, "transcript_entries", None)
         meta = self._room_metadata(context)
         call = meta.get("call") or {}
@@ -532,12 +572,14 @@ class VoiceAgent(Agent):
         is_web = str(to_dest).strip().lower() == "webtest"
         agent_cfg = meta.get("agent") or {}
         tool_configs = agent_cfg.get("toolConfigs") or {}
-        transfer_cfg = tool_configs.get("transfer_call") or {}
+        config_key = (config_key or "transfer_call").strip() or "transfer_call"
+        transfer_cfg = tool_configs.get(config_key) or {}
         transfer_to = (transfer_cfg.get("transferTo") or "").strip() or None
         call_id = call.get("id")
 
         logger.info(
-            "[transfer] tool called: call_id=%s to_dest=%s is_web=%s transfer_to=%s has_transfer_cfg=%s",
+            "[transfer] tool called: config_key=%s call_id=%s to_dest=%s is_web=%s transfer_to=%s has_transfer_cfg=%s",
+            config_key,
             call_id,
             to_dest or "(empty)",
             is_web,
@@ -546,7 +588,7 @@ class VoiceAgent(Agent):
         )
 
         tid = uuid.uuid4().hex[:16]
-        inp = {"execution_message": execution_message}
+        inp = {"execution_message": execution_message, "config_key": config_key}
         if entries is not None:
             entries.append({"kind": "tool_invocation", "toolCallId": tid, "toolName": "transfer_call", "input": inp})
 
@@ -564,7 +606,8 @@ class VoiceAgent(Agent):
         if not transfer_to:
             tool_keys = list(tool_configs.keys()) if isinstance(tool_configs, dict) else []
             logger.warning(
-                "[transfer] skipped: reason=no_transfer_number toolConfigs.transfer_call=%s toolConfigKeysReceived=%s",
+                "[transfer] skipped: reason=no_transfer_number config_key=%s toolConfigs[config_key]=%s toolConfigKeysReceived=%s",
+                config_key,
                 transfer_cfg,
                 tool_keys,
             )
@@ -1169,10 +1212,16 @@ async def _run_session(ctx: JobContext, inbound_config: dict | None = None):
             else:
                 voicemail_rule = "\n\nVOICEMAIL: If you are told or detect that the call reached voicemail, leave a brief professional voicemail then call end_call."
     transfer_call_rule = ""
-    if "transfer_call" in enabled:
+    transfer_instances = _transfer_instance_keys_with_names(ctx)
+    if not transfer_instances:
+        # Fallback: any transfer key in enabled (e.g. toolConfigs not in metadata yet)
+        transfer_instances = [(k, k) for k in enabled if _is_transfer_call_key(k)]
+    if transfer_instances:
+        config_help = "; ".join(f"config_key={key!r} for {name!r}" for key, name in transfer_instances)
         transfer_call_rule = (
-            "\n\nTRANSFER: You have a transfer_call tool. When the user asks to speak to a person or be transferred, "
-            "use it. If the tool returns that transfer is unavailable or failed, tell the customer clearly (e.g. "
+            "\n\nTRANSFER: You have a transfer_call(execution_message, config_key) tool. When the user asks to speak to a person or be transferred, "
+            "use it. Pass config_key to choose which destination: " + config_help + ". "
+            "If the tool returns that transfer is unavailable or failed, tell the customer clearly (e.g. "
             "\"Sorry, I couldn't transfer you\" or \"Transfer isn't available on this call\") and offer to help them "
             "directly or take a callback. Do NOT use end_call when transfer fails—only use end_call when the user "
             "says goodbye or is done with the conversation."
